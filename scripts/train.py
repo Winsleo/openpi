@@ -239,7 +239,12 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
-
+    
+    trainable_params = train_state.params.filter(config.trainable_filter)
+    print("\n=== Trainable Parameters Summary ===")
+    training_utils.print_trainable_params_info(train_state.params, trainable_params, config.trainable_filter)
+    print("=" * 50)
+    
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
