@@ -21,20 +21,71 @@ Example:
     >>> # Nested composition
     >>> inner = Compose.random(loader_a, loader_b)
     >>> outer = Compose.proportional(inner, loader_c, ratios=[2, 1])
+    >>>
+    >>> # Set seed for reproducibility
+    >>> set_seed(42)
 """
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterator
 import itertools
-import random
 from typing import Dict, Optional, Protocol, Sequence, TypeVar, Union, runtime_checkable
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader as TorchDataLoader, Dataset as TorchDataset
 
+
+# =============================================================================
+# Random Number Generator Management
+# =============================================================================
+
+# Module-level random number generator using NumPy's modern Generator API
+_rng: np.random.Generator = np.random.default_rng()
+
+
+def set_seed(seed: Optional[int] = None) -> np.random.Generator:
+    """Set the random seed for reproducibility.
+    
+    This function resets the module-level random number generator with the
+    given seed. All composable DataLoaders use this generator for shuffling
+    and sampling operations.
+    
+    Args:
+        seed: Random seed. If None, uses a non-deterministic seed.
+        
+    Returns:
+        The new random number generator instance.
+        
+    Examples:
+        >>> set_seed(42)  # For reproducible results
+        >>> loader = Compose.random(loader_a, loader_b)
+        >>> 
+        >>> # Reset with a different seed
+        >>> set_seed(123)
+    """
+    global _rng
+    _rng = np.random.default_rng(seed)
+    return _rng
+
+
+def get_rng() -> np.random.Generator:
+    """Get the current random number generator.
+    
+    Returns:
+        The module-level numpy random Generator instance.
+        
+    Examples:
+        >>> rng = get_rng()
+        >>> rng.random()  # Generate a random number
+    """
+    return _rng
+
 __all__ = [
+    # Random seed management
+    "set_seed",
+    "get_rng",
     # Protocols and base classes
     "BaseDataLoader",
     "ComposableDataLoader",
@@ -223,7 +274,7 @@ class RandomMixDataLoader(ComposableDataLoader):
         while active_indices:
             probs = self.weights[active_indices]
             probs = probs / probs.sum()
-            idx = np.random.choice(active_indices, p=probs)
+            idx = _rng.choice(active_indices, p=probs)
             
             try:
                 batch = next(iterators[idx])
@@ -286,7 +337,7 @@ class ProportionalMixDataLoader(ComposableDataLoader):
         schedule = []
         for idx, num_batches in enumerate(self.batches_per_loader):
             schedule.extend([idx] * num_batches)
-        random.shuffle(schedule)
+        _rng.shuffle(schedule)
         
         for loader_idx in schedule:
             try:
@@ -395,7 +446,7 @@ class TaskTaggedDataLoader(ComposableDataLoader):
         
         while active_tasks:
             if self.sampling_strategy == 'random':
-                task = random.choice(list(active_tasks))
+                task = _rng.choice(list(active_tasks))
             elif self.sampling_strategy == 'round_robin':
                 task = next(task_cycle)
                 while task not in active_tasks:
@@ -521,7 +572,7 @@ class DynamicScheduleDataLoader(ComposableDataLoader):
         while active_indices:
             probs = self.weights[active_indices]
             probs = probs / probs.sum()
-            idx = np.random.choice(active_indices, p=probs)
+            idx = _rng.choice(active_indices, p=probs)
             
             try:
                 batch = next(iterators[idx])
@@ -627,8 +678,8 @@ class InBatchMixDataLoader(ComposableDataLoader):
                 combined_data = torch.cat(mixed_batch_data, dim=0)
                 combined_labels = torch.cat(mixed_batch_labels, dim=0)
                 
-                # Shuffle combined batch
-                indices = torch.randperm(len(combined_data))
+                # Shuffle combined batch using module-level RNG
+                indices = torch.from_numpy(_rng.permutation(len(combined_data)))
                 yield combined_data[indices], combined_labels[indices]
     
     def __len__(self):
@@ -686,7 +737,7 @@ class CurriculumDataLoader(ComposableDataLoader):
         
         while batches_yielded < total_batches:
             active_loaders = self.stages[self.current_stage]
-            loader_idx = random.choice(active_loaders)
+            loader_idx = _rng.choice(active_loaders)
             
             try:
                 batch = next(iterators[loader_idx])
@@ -996,7 +1047,7 @@ def example_training_loop():
     for epoch in range(2):
         total_loss = 0.0
         for batch in train_loader:
-            fake_loss = random.random()
+            fake_loss = _rng.random()
             total_loss += fake_loss
         
         avg_loss = total_loss / len(train_loader)
@@ -1013,7 +1064,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("ComposableDataLoader Examples")
     print("=" * 60)
-    
+    set_seed(42)
     example_basic_usage()
     example_nested_composition()
     example_dynamic_scheduling()
