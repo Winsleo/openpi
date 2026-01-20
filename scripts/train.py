@@ -54,15 +54,37 @@ def _prepare_validation_config(
     )
 
     use_norm_stats = False
-    if config.val_repo_id or hasattr(val_config.data, "repo_id"):
-        repo_id = config.val_repo_id or (getattr(val_config.data, "repo_id", None) + "-val")
+    
+    # Determine the data factory to use for validation
+    # When using composable_data, get the first dataset config as reference
+    if config.composable_data is not None and config.composable_data.dataset_configs:
+        data_factory = config.composable_data.dataset_configs[0]
+    else:
+        data_factory = val_config.data
+    
+    # Check if we have a valid repo_id source
+    has_repo_id = config.val_repo_id or (hasattr(data_factory, "repo_id") and data_factory.repo_id)
+    
+    if has_repo_id:
+        repo_id = config.val_repo_id or getattr(data_factory, "repo_id", None)
+        if repo_id is None:
+            raise ValueError("No validation repository ID could be determined")
+        
         # Safely get val_episodes_index, defaulting to None if not present
         episodes_index = getattr(config, 'val_episodes_index', None)
 
-        # Create validation data config by copying the training data config but changing repo_id
-        val_base_config = dataclasses.replace(val_config.data.base_config, episodes_index=episodes_index)
-        val_data_config = dataclasses.replace(val_config.data, repo_id=repo_id, base_config=val_base_config)
-        val_config = dataclasses.replace(val_config, data=val_data_config)
+        # Create validation data config by copying the data factory but changing repo_id
+        # Check if base_config exists and is a dataclass
+        base_config = getattr(data_factory, 'base_config', None)
+        if base_config is not None and dataclasses.is_dataclass(base_config):
+            val_base_config = dataclasses.replace(base_config, episodes_index=episodes_index)
+            val_data_factory = dataclasses.replace(data_factory, repo_id=repo_id, base_config=val_base_config)
+        else:
+            # For data factories without base_config (e.g., SimpleDataConfig)
+            val_data_factory = dataclasses.replace(data_factory, repo_id=repo_id)
+        
+        # Update val_config with the new data factory (disable composable_data for validation)
+        val_config = dataclasses.replace(val_config, data=val_data_factory, composable_data=None)
 
         # Create the actual DataConfig using the factory and add norm_stats
         actual_val_data_config = val_config.data.create(val_config.assets_dirs, val_config.model)

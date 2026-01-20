@@ -474,6 +474,35 @@ class RLDSDroidDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class ComposableDataConfig:
+    """Configuration for composable/mixed dataset training.
+    
+    This config allows combining multiple datasets with various mixing strategies
+    for multi-task or multi-domain training.
+    """
+    # List of data config factories for each dataset
+    dataset_configs: Sequence[DataConfigFactory] = ()
+    
+    # Composition strategy: "random", "proportional", "round_robin", "alternating", "tagged", "dynamic"
+    composition_strategy: str = "random"
+    
+    # Weights for random mixing (must match number of datasets)
+    weights: Sequence[float] | None = None
+    
+    # Ratios for proportional mixing (must match number of datasets)
+    ratios: Sequence[float] | None = None
+    
+    # Pattern for alternating strategy (indices into dataset_configs)
+    pattern: Sequence[int] | None = None
+    
+    # Task names for tagged strategy (must match number of datasets)
+    task_names: Sequence[str] | None = None
+    
+    # Random seed for reproducibility
+    seed: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotDROIDDataConfig(DataConfigFactory):
     """
     Example data config for custom DROID dataset in LeRobot format.
@@ -542,8 +571,12 @@ class TrainConfig:
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
 
-    # Determines the data to be trained on.
+    # Determines the data to be trained on (single dataset).
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
+    
+    # Optional: Configuration for composable/mixed dataset training.
+    # If set, this takes precedence over 'data' and enables multi-dataset training.
+    composable_data: ComposableDataConfig | None = None
 
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
@@ -744,6 +777,59 @@ _CONFIGS = [
                 episodes_index=list(range(190)),
                 behavior_dataset_root="/data/behavior-1k-dataset",
             ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/model/pi05_base/params"),
+        num_train_steps=50000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=50, paligemma_variant="gemma"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        val_log_interval=5000,
+        val_repo_id="behavior-1k/2025-challenge-demos",
+        val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=min(32, os.cpu_count() - 2),
+    ),
+    
+    # Mixed dataset training example for B1K
+    # This config demonstrates how to train on multiple datasets simultaneously
+    # using the composable data loader with weighted random mixing.
+    # Note: When composable_data is set, the 'data' field is not used (defaults to FakeDataConfig).
+    TrainConfig(
+        name="pi05_b1k_mixed",
+        exp_name="openpi_mixed",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, paligemma_variant="gemma_2b"),
+        # Composable data configuration for mixed training
+        # (no need to specify 'data' - it's ignored when composable_data is set)
+        composable_data=ComposableDataConfig(
+            dataset_configs=[
+                # Dataset 1: First subset of B1K demos
+                LeRobotB1KDataConfig(
+                    repo_id="behavior-1k/2025-challenge-demos",
+                    base_config=DataConfig(
+                        prompt_from_task=True,
+                        episodes_index=list(range(100)),  # Episodes 0-99
+                        behavior_dataset_root="/data/behavior-1k-dataset",
+                    ),
+                ),
+                # Dataset 2: Second subset of B1K demos
+                LeRobotB1KDataConfig(
+                    repo_id="behavior-1k/2025-challenge-demos",
+                    base_config=DataConfig(
+                        prompt_from_task=True,
+                        episodes_index=list(range(100, 190)),  # Episodes 100-189
+                        behavior_dataset_root="/data/behavior-1k-dataset",
+                    ),
+                ),
+                # You can add more datasets here, for example:
+                # Dataset 3: Another LeRobot dataset
+                # LeRobotAlohaDataConfig(repo_id="other/dataset", ...),
+            ],
+            composition_strategy="random",  # Options: "random", "proportional", "round_robin", "tagged", "dynamic"
+            weights=[0.6, 0.4],  # 60% from dataset 1, 40% from dataset 2
+            seed=42,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/model/pi05_base/params"),
         num_train_steps=50000,
