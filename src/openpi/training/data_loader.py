@@ -14,6 +14,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+import openpi.training.composable_dataloader as composable
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -266,7 +267,23 @@ def create_data_loader(
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
+    
+    Note:
+        If config.composable_data is set, this function will automatically use
+        the composable data loader for mixed dataset training.
     """
+    # Check if composable/mixed dataset training is configured
+    if config.composable_data is not None:
+        logging.info("Using composable data loader for mixed dataset training")
+        return create_composable_data_loader(
+            config,
+            config.composable_data,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            skip_norm_stats=skip_norm_stats,
+        )
+    
     if data_config is None:
         data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
@@ -605,3 +622,184 @@ class DataLoaderImpl(DataLoader):
     def __iter__(self):
         for batch in self._data_loader:
             yield _model.Observation.from_dict(batch), batch["actions"]
+
+
+# =============================================================================
+# Composable DataLoader Support
+# =============================================================================
+
+class ComposableDataLoaderWrapper:
+    """Wrapper that makes ComposableDataLoader compatible with openpi's DataLoader protocol.
+    
+    This wrapper converts the output batches from the composable dataloader to the format
+    expected by the training loop (Observation, Actions tuple).
+    """
+    
+    def __init__(
+        self,
+        composable_loader: composable.ComposableDataLoader,
+        primary_data_config: _config.DataConfig,
+    ):
+        """Initialize the wrapper.
+        
+        Args:
+            composable_loader: The composed DataLoader instance.
+            primary_data_config: The data config from the primary/first dataset.
+                Used to provide norm_stats and other config for the training loop.
+        """
+        self._composable_loader = composable_loader
+        self._data_config = primary_data_config
+    
+    def data_config(self) -> _config.DataConfig:
+        return self._data_config
+    
+    def __iter__(self):
+        for batch in self._composable_loader:
+            # Batch from DataLoaderImpl is already (Observation, actions) tuple
+            if isinstance(batch, tuple) and len(batch) == 2:
+                first, second = batch
+                # Tagged batch: (task_name, (Observation, actions))
+                if isinstance(first, str):
+                    _task_name, (obs, actions) = first, second
+                    yield obs, actions
+                # Already processed: (Observation, actions)
+                elif isinstance(first, _model.Observation):
+                    yield first, second
+                # Raw dict batch that was somehow wrapped
+                else:
+                    yield _model.Observation.from_dict(first), second
+            else:
+                # Raw dict batch (shouldn't happen with DataLoaderImpl, but handle for safety)
+                yield _model.Observation.from_dict(batch), batch["actions"]
+    
+    def __len__(self) -> int:
+        return len(self._composable_loader)
+
+
+def create_composable_data_loader(
+    config: _config.TrainConfig,
+    composable_config: _config.ComposableDataConfig,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = True,
+    num_batches: int | None = None,
+    skip_norm_stats: bool = False,
+) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    """Create a composable data loader that combines multiple datasets.
+    
+    This function creates individual DataLoaders for each dataset configuration
+    and then combines them using the specified composition strategy.
+    
+    Args:
+        config: The training configuration (provides model config, batch size, etc.).
+        composable_config: ComposableDataConfig containing all mixing settings:
+            - dataset_configs: Sequence of DataConfigFactory instances
+            - composition_strategy: "random", "proportional", "round_robin", etc.
+            - weights, ratios, pattern, task_names: Strategy-specific options
+            - seed: Random seed for reproducibility
+        sharding: JAX sharding for the data loader.
+        shuffle: Whether to shuffle individual datasets.
+        num_batches: Total number of batches. If None, uses sum of dataset lengths.
+        skip_norm_stats: Whether to skip data normalization.
+        
+    Returns:
+        A DataLoader that yields combined batches from all datasets.
+        
+    Examples:
+        >>> composable_cfg = ComposableDataConfig(
+        ...     dataset_configs=[dataset_config_a, dataset_config_b],
+        ...     composition_strategy="random",
+        ...     weights=[0.7, 0.3],
+        ... )
+        >>> loader = create_composable_data_loader(config, composable_cfg)
+    """
+    # Extract settings from composable_config
+    dataset_configs = composable_config.dataset_configs
+    composition_strategy = composable_config.composition_strategy
+    weights = composable_config.weights
+    ratios = composable_config.ratios
+    pattern = composable_config.pattern
+    task_names = composable_config.task_names
+    seed = composable_config.seed
+    
+    if seed is not None:
+        composable.set_seed(seed)
+    
+    # Create individual data loaders for each dataset
+    individual_loaders = []
+    data_configs = []
+    
+    for i, dataset_config_factory in enumerate(dataset_configs):
+        # Create the DataConfig from the factory
+        data_config = dataset_config_factory.create(config.assets_dirs, config.model)
+        data_configs.append(data_config)
+        
+        # Create a modified config for this dataset
+        dataset_train_config = _create_single_dataset_config(config, dataset_config_factory)
+        
+        # Create the data loader for this dataset
+        loader = create_data_loader(
+            dataset_train_config,
+            data_config=data_config,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=None,  # Don't limit individual loaders
+            skip_norm_stats=skip_norm_stats,
+        )
+        individual_loaders.append(loader)
+        logging.info(f"Created data loader {i} for {data_config.repo_id}")
+    
+    # Use the first data config as the primary config
+    primary_data_config = data_configs[0]
+    
+    # Create the composed loader based on strategy
+    if composition_strategy == "random":
+        composed = composable.Compose.random(*individual_loaders, weights=weights)
+    elif composition_strategy == "proportional":
+        composed = composable.Compose.proportional(
+            *individual_loaders, 
+            ratios=ratios, 
+            max_batches=num_batches
+        )
+    elif composition_strategy == "round_robin":
+        composed = composable.Compose.round_robin(*individual_loaders)
+    elif composition_strategy == "alternating":
+        composed = composable.Compose.alternating(*individual_loaders, pattern=pattern)
+    elif composition_strategy == "tagged":
+        # Create task names if not provided
+        if task_names is None:
+            task_names = [
+                dc.repo_id or f"dataset_{i}" 
+                for i, dc in enumerate(data_configs)
+            ]
+        loaders_dict = dict(zip(task_names, individual_loaders))
+        composed = composable.Compose.tagged(loaders_dict, sampling_strategy="random")
+    elif composition_strategy == "dynamic":
+        composed = composable.Compose.dynamic(*individual_loaders, initial_weights=weights)
+    else:
+        raise ValueError(f"Unknown composition strategy: {composition_strategy}")
+    
+    logging.info(f"Created composable data loader with strategy '{composition_strategy}'")
+    logging.info(f"  - Number of datasets: {len(individual_loaders)}")
+    if weights is not None:
+        logging.info(f"  - Weights: {weights}")
+    if ratios is not None:
+        logging.info(f"  - Ratios: {ratios}")
+    
+    return ComposableDataLoaderWrapper(composed, primary_data_config)
+
+
+def _create_single_dataset_config(
+    base_config: _config.TrainConfig,
+    data_factory: _config.DataConfigFactory,
+) -> _config.TrainConfig:
+    """Create a TrainConfig for a single dataset within a composed loader.
+    
+    This helper creates a modified TrainConfig that uses the specified
+    data factory while inheriting other settings from the base config.
+    
+    Important: composable_data is set to None to prevent infinite recursion
+    when create_data_loader is called for individual datasets.
+    """
+    import dataclasses
+    return dataclasses.replace(base_config, data=data_factory, composable_data=None)
