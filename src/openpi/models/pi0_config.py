@@ -32,6 +32,11 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Flexible freezing options: specify which components to freeze
+    # Supported components: 'llm_base', 'action_expert_base', 'vision_encoder', 'action_proj'
+    # If None, uses legacy LoRA-based freezing logic
+    freeze_components: list[str] | None = None
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -77,7 +82,16 @@ class Pi0Config(_model.BaseModelConfig):
         return observation_spec, action_spec
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
-        """Returns the freeze filter based on the model config."""
+        """Returns the freeze filter based on the model config.
+
+        If freeze_components is specified, uses component-based freezing for more flexibility.
+        Otherwise, falls back to legacy LoRA-based freezing logic.
+        """
+        # New flexible component-based freezing
+        if self.freeze_components is not None:
+            return self._get_component_freeze_filter()
+
+        # Legacy LoRA-based freezing logic
         filters = []
         has_lora = False
         gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
@@ -106,3 +120,63 @@ class Pi0Config(_model.BaseModelConfig):
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
+
+    def _get_component_freeze_filter(self) -> nnx.filterlib.Filter:
+        """Create freeze filter based on specified components to freeze.
+
+        Supported components:
+        - 'llm_base': Base LLM parameters (llm.* but not lora and not _1)
+        - 'action_expert_base': Action expert base parameters (llm.*_1.*)
+        - 'vision_encoder': Vision encoder parameters (img.*)
+        - 'action_proj': Action projection layers (action_in_proj, action_out_proj, etc.)
+        """
+        if not self.freeze_components:
+            return nnx.Nothing
+
+        filters = []
+
+        for component in self.freeze_components:
+            if component == "llm_base":
+                # Freeze base LLM params: llm.* but exclude action expert (_1) and lora params
+                filters.append(
+                    nnx.All(
+                        nnx_utils.PathRegex(".*llm.*"),
+                        nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*")),  # Exclude action expert
+                        nnx.Not(nnx_utils.PathRegex(".*lora.*")),     # Exclude lora params
+                    )
+                )
+            elif component == "action_expert_base":
+                # Freeze action expert base params: llm.*_1.* but exclude lora params
+                filters.append(
+                    nnx.All(
+                        nnx_utils.PathRegex(".*llm.*_1.*"),
+                        nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+                    )
+                )
+            elif component == "vision_encoder":
+                # Freeze vision encoder params
+                filters.append(nnx_utils.PathRegex(".*img.*"))
+            elif component == "action_proj":
+                # Freeze action projection layers
+                action_proj_patterns = [
+                    ".*action_in_proj.*",
+                    ".*action_out_proj.*",
+                    ".*action_time_mlp_in.*",
+                    ".*action_time_mlp_out.*",
+                    ".*state_proj.*"
+                ]
+                action_filters = [nnx_utils.PathRegex(pattern) for pattern in action_proj_patterns]
+                filters.append(nnx.Any(*action_filters))
+            elif component == "lora":
+                filters.append(nnx_utils.PathRegex(".*lora.*"))
+            elif component == "all":
+                filters.append(nnx.Everything)
+            else:
+                raise ValueError(f"Unknown freeze component: {component}. "
+                               f"Supported components: llm_base, action_expert_base, vision_encoder, action_proj")
+
+        if not filters:
+            return nnx.Nothing
+
+        # Combine all component filters - a parameter is frozen if it matches ANY of the component filters
+        return nnx.Any(*filters)
