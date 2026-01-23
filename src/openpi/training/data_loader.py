@@ -7,7 +7,7 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -127,6 +127,32 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int) -> Dataset:
+    """Create a dataset for training."""
+    from omnigibson.learning.datas.lerobot_dataset import BehaviorLeRobotDataset
+    
+    print("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
+    dataset = BehaviorLeRobotDataset(
+        repo_id=data_config.repo_id,
+        root=data_config.behavior_dataset_root,
+        tasks=["picking_up_trash"],
+        modalities=["rgb"],
+        local_only=True,
+        delta_timestamps={
+            key: [t / 30.0 for t in range(action_horizon)] for key in data_config.action_sequence_keys
+        },
+        episodes=data_config.episodes_index,
+        chunk_streaming_using_keyframe=True,
+        shuffle=True,
+    )
+    print("*********************************************")
+
+    if data_config.prompt_from_task:
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset.meta.tasks)])
+
+    return dataset
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -223,6 +249,7 @@ def transform_iterable_dataset(
 def create_data_loader(
     config: _config.TrainConfig,
     *,
+    data_config: _config.DataConfig | None = None,
     sharding: jax.sharding.Sharding | None = None,
     shuffle: bool = False,
     num_batches: int | None = None,
@@ -233,13 +260,15 @@ def create_data_loader(
 
     Args:
         config: The training configuration.
+        data_config: Optional pre-configured data config. If None, will be created from config.
         sharding: The sharding to use for the data loader (JAX only).
         shuffle: Whether to shuffle the data.
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
     """
-    data_config = config.data.create(config.assets_dirs, config.model)
+    if data_config is None:
+        data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
@@ -253,19 +282,57 @@ def create_data_loader(
             skip_norm_stats=skip_norm_stats,
             framework=framework,
         )
-    return create_torch_data_loader(
-        data_config,
-        model_config=config.model,
-        action_horizon=config.model.action_horizon,
-        batch_size=config.batch_size,
+    elif data_config.behavior_dataset_root is not None:
+        # Handle behavior datasets by reusing create_behavior_data_loader
+        return create_behavior_data_loader(
+            config,
+            data_config=data_config,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            skip_norm_stats=skip_norm_stats,
+        )
+    else:
+        return create_torch_data_loader(
+            data_config,
+            model_config=config.model,
+            action_horizon=config.model.action_horizon,
+            batch_size=config.batch_size,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            num_workers=config.num_workers,
+            seed=config.seed,
+            skip_norm_stats=skip_norm_stats,
+            framework=framework,
+        )
+
+
+def create_behavior_data_loader(
+    config: _config.TrainConfig,
+    *,
+    data_config: _config.DataConfig | None = None,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    skip_norm_stats: bool = False,
+) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    if data_config is None:
+        data_config = config.data.create(config.assets_dirs, config.model)
+    dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon)
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+
+    data_loader = TorchDataLoader(
+        dataset,
+        local_batch_size=config.batch_size // jax.process_count(),
         sharding=sharding,
         shuffle=shuffle,
         num_batches=num_batches,
         num_workers=config.num_workers,
         seed=config.seed,
-        skip_norm_stats=skip_norm_stats,
-        framework=framework,
     )
+
+    return DataLoaderImpl(data_config, data_loader)
 
 
 def create_torch_data_loader(
