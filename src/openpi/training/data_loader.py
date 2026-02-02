@@ -551,6 +551,17 @@ class TorchDataLoader:
                 else:
                     yield jax.tree.map(torch.as_tensor, batch)
 
+    def __len__(self) -> int:
+        """Return the number of batches.
+
+        Returns:
+            If num_batches was specified, returns that value.
+            Otherwise, returns the number of batches in one epoch.
+        """
+        if self._num_batches is not None:
+            return self._num_batches
+        return len(self._data_loader)
+
 
 def _collate_fn(items):
     """Collate the batch elements into batched numpy arrays."""
@@ -622,6 +633,9 @@ class DataLoaderImpl(DataLoader):
     def __iter__(self):
         for batch in self._data_loader:
             yield _model.Observation.from_dict(batch), batch["actions"]
+
+    def __len__(self) -> int:
+        return len(self._data_loader)
 
 
 # =============================================================================

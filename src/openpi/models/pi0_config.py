@@ -163,6 +163,8 @@ class Pi0Config(_model.BaseModelConfig):
                     ".*action_out_proj.*",
                     ".*action_time_mlp_in.*",
                     ".*action_time_mlp_out.*",
+                    ".*time_mlp_in.*",
+                    ".*time_mlp_out.*",
                     ".*state_proj.*"
                 ]
                 action_filters = [nnx_utils.PathRegex(pattern) for pattern in action_proj_patterns]
