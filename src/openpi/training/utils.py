@@ -42,7 +42,7 @@ def print_trainable_params_info(
     all_params: nnx.State, trainable_params: nnx.State, freeze_filter: nnx.filterlib.Filter
 ) -> None:
     """Print information about which parameters are trainable vs frozen."""
-
+    action_proj_patterns = ['action_in_proj', 'action_out_proj', 'action_time_mlp_in', 'action_time_mlp_out', 'time_mlp_in', 'time_mlp_out', 'state_proj']
     def count_params(state: nnx.State) -> tuple[int, dict[str, int]]:
         """Count total parameters and parameters by category."""
         total_params = 0
@@ -64,7 +64,7 @@ def print_trainable_params_info(
                         category = 'llm_base'
                 elif 'img' in path_str:
                     category = 'vision_encoder'
-                elif any(x in path_str for x in ['action_in_proj', 'action_out_proj', 'action_time_mlp_in', 'action_time_mlp_out', 'state_proj']):
+                elif any(x in path_str for x in action_proj_patterns):
                     category = 'action_proj'
                 else:
                     category = 'other'
@@ -104,7 +104,7 @@ def print_trainable_params_info(
 
     llm_params = [p for p in flat_all.keys() if 'llm' in str(p)]
     img_params = [p for p in flat_all.keys() if 'img' in str(p)]
-    action_params = [p for p in flat_all.keys() if any(x in str(p) for x in ['action_in_proj', 'action_out_proj', 'action_time_mlp_in', 'action_time_mlp_out', 'state_proj'])]
+    action_params = [p for p in flat_all.keys() if any(x in str(p) for x in action_proj_patterns)]
 
     def check_category(name, params):
         trainable = sum(1 for p in params if p in flat_trainable)
