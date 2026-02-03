@@ -719,9 +719,9 @@ def create_composable_data_loader(
             - dataset_configs: Sequence of DataConfigFactory instances
             - composition_strategy: "random", "proportional", "round_robin", 
               "alternating", "tagged", "dynamic", or "inbatch"
-            - weights, ratios, pattern, task_names: Strategy-specific options
-            - samples_per_loader, inbatch_random_sample: For "inbatch" strategy
-            - seed: Random seed for reproducibility
+            - weights: For random/proportional used as-is; for inbatch,
+              samples_per_loader = weights * batch_size (normalized)
+            - pattern, task_names, inbatch_random_sample, seed: Other options
         sharding: JAX sharding for the data loader.
         shuffle: Whether to shuffle individual datasets.
         num_batches: Total number of batches. If None, uses sum of dataset lengths.
@@ -742,7 +742,6 @@ def create_composable_data_loader(
     dataset_configs = composable_config.dataset_configs
     composition_strategy = composable_config.composition_strategy
     weights = composable_config.weights
-    ratios = composable_config.ratios
     pattern = composable_config.pattern
     task_names = composable_config.task_names
     seed = composable_config.seed
@@ -783,8 +782,8 @@ def create_composable_data_loader(
         composed = composable.Compose.random(*individual_loaders, weights=weights)
     elif composition_strategy == "proportional":
         composed = composable.Compose.proportional(
-            *individual_loaders, 
-            ratios=ratios, 
+            *individual_loaders,
+            ratios=weights,
             max_batches=num_batches
         )
     elif composition_strategy == "round_robin":
@@ -803,9 +802,22 @@ def create_composable_data_loader(
     elif composition_strategy == "dynamic":
         composed = composable.Compose.dynamic(*individual_loaders, initial_weights=weights)
     elif composition_strategy == "inbatch":
+        batch_size = config.batch_size
+        num_loaders = len(individual_loaders)
+        if weights is not None:
+            w = np.array(weights, dtype=np.float64) / sum(weights)
+            samples_per_loader = (w * batch_size).astype(np.int64)
+            diff = batch_size - int(samples_per_loader.sum())
+            if diff != 0:
+                samples_per_loader[-1] += diff
+            samples_per_loader = samples_per_loader.tolist()
+        else:
+            # Equal split: weights * batch_size with uniform weights
+            samples_per_loader = [batch_size // num_loaders] * num_loaders
+            samples_per_loader[-1] += batch_size - sum(samples_per_loader)
         composed = composable.Compose.inbatch(
             *individual_loaders,
-            samples_per_loader=composable_config.samples_per_loader,
+            samples_per_loader=samples_per_loader,
             random_sample=composable_config.inbatch_random_sample,
         )
     else:
@@ -820,10 +832,6 @@ def create_composable_data_loader(
     logging.info(f"  - Number of datasets: {len(individual_loaders)}")
     if weights is not None:
         logging.info(f"  - Weights: {weights}")
-    if ratios is not None:
-        logging.info(f"  - Ratios: {ratios}")
-    if composition_strategy == "inbatch" and composable_config.samples_per_loader is not None:
-        logging.info(f"  - Samples per loader: {composable_config.samples_per_loader}")
     
     return ComposableDataLoaderWrapper(composed, primary_data_config, return_source=return_source)
 
