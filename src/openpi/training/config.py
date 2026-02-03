@@ -479,11 +479,20 @@ class ComposableDataConfig:
     
     This config allows combining multiple datasets with various mixing strategies
     for multi-task or multi-domain training.
+    
+    Supported strategies:
+        - "random": Sample from loaders with optional weights
+        - "proportional": Fixed ratio allocation of batches
+        - "round_robin": Cycle through loaders sequentially
+        - "alternating": Custom pattern-based alternation
+        - "tagged": Add source labels to batches
+        - "dynamic": Adjust weights based on training feedback
+        - "inbatch": Mix samples from multiple loaders within a single batch
     """
     # List of data config factories for each dataset
     dataset_configs: Sequence[DataConfigFactory] = ()
     
-    # Composition strategy: "random", "proportional", "round_robin", "alternating", "tagged", "dynamic"
+    # Composition strategy
     composition_strategy: str = "random"
     
     # Weights for random mixing (must match number of datasets)
@@ -500,6 +509,14 @@ class ComposableDataConfig:
 
     # Whether to tag each batch with its source loader name
     return_source: bool = False
+    
+    # Samples per loader for inbatch mixing (must match number of datasets)
+    # If None, samples are divided equally based on total_batch_size
+    samples_per_loader: Sequence[int] | None = None
+    
+    # Whether to randomly sample from each batch (for inbatch strategy)
+    # If True, randomly selects samples; if False, takes first N samples
+    inbatch_random_sample: bool = False
     
     # Random seed for reproducibility
     seed: int | None = None

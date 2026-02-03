@@ -717,8 +717,10 @@ def create_composable_data_loader(
         config: The training configuration (provides model config, batch size, etc.).
         composable_config: ComposableDataConfig containing all mixing settings:
             - dataset_configs: Sequence of DataConfigFactory instances
-            - composition_strategy: "random", "proportional", "round_robin", etc.
+            - composition_strategy: "random", "proportional", "round_robin", 
+              "alternating", "tagged", "dynamic", or "inbatch"
             - weights, ratios, pattern, task_names: Strategy-specific options
+            - samples_per_loader, inbatch_random_sample: For "inbatch" strategy
             - seed: Random seed for reproducibility
         sharding: JAX sharding for the data loader.
         shuffle: Whether to shuffle individual datasets.
@@ -743,8 +745,8 @@ def create_composable_data_loader(
     ratios = composable_config.ratios
     pattern = composable_config.pattern
     task_names = composable_config.task_names
-    return_source = composable_config.return_source
     seed = composable_config.seed
+    return_source = composable_config.return_source
     
     if seed is not None:
         composable.set_seed(seed)
@@ -800,20 +802,28 @@ def create_composable_data_loader(
         composed = composable.Compose.tagged(loaders_dict, sampling_strategy="random")
     elif composition_strategy == "dynamic":
         composed = composable.Compose.dynamic(*individual_loaders, initial_weights=weights)
+    elif composition_strategy == "inbatch":
+        composed = composable.Compose.inbatch(
+            *individual_loaders,
+            samples_per_loader=composable_config.samples_per_loader,
+            random_sample=composable_config.inbatch_random_sample,
+        )
     else:
         raise ValueError(f"Unknown composition strategy: {composition_strategy}")
-    
+
     if return_source and composition_strategy != "tagged":
         if task_names is None:
             task_names = [dc.repo_id or f"dataset_{i}" for i, dc in enumerate(data_configs)]
         composed = composable.SourceTaggedDataLoader(composed, task_names)
-
+    
     logging.info(f"Created composable data loader with strategy '{composition_strategy}'")
     logging.info(f"  - Number of datasets: {len(individual_loaders)}")
     if weights is not None:
         logging.info(f"  - Weights: {weights}")
     if ratios is not None:
         logging.info(f"  - Ratios: {ratios}")
+    if composition_strategy == "inbatch" and composable_config.samples_per_loader is not None:
+        logging.info(f"  - Samples per loader: {composable_config.samples_per_loader}")
     
     return ComposableDataLoaderWrapper(composed, primary_data_config, return_source=return_source)
 

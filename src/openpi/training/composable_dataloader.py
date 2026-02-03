@@ -32,9 +32,37 @@ from collections.abc import Iterator
 import itertools
 from typing import Dict, Optional, Protocol, Sequence, TypeVar, Union, runtime_checkable
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import torch
 from torch.utils.data import DataLoader as TorchDataLoader, Dataset as TorchDataset
+
+
+def _is_jax_array(x) -> bool:
+    """Check if x is a JAX array."""
+    return hasattr(x, 'device') and hasattr(x, 'sharding') and hasattr(x, 'at')
+
+
+def _get_sharding(data):
+    """Extract sharding from a JAX array.
+    
+    Returns the sharding object if available, None otherwise.
+    """
+    if _is_jax_array(data) and hasattr(data, 'sharding'):
+        return data.sharding
+    return None
+
+
+def _apply_sharding(data, sharding):
+    """Apply sharding to data using jax.device_put.
+    
+    This is used to restore correct sharding after JAX operations
+    like concatenation that may lose sharding information.
+    """
+    if sharding is not None:
+        return jax.device_put(data, sharding)
+    return data
 
 
 # =============================================================================
@@ -730,16 +758,133 @@ class DynamicScheduleDataLoader(ComposableDataLoader):
 # In-Batch Mix DataLoader
 # =============================================================================
 
+def _get_batch_size(data) -> int:
+    """Get batch size from data (typically actions/labels which are always arrays)."""
+    if hasattr(data, 'shape'):
+        return data.shape[0]
+    if hasattr(data, '__len__'):
+        return len(data)
+    raise TypeError(f"Cannot determine batch size for type {type(data)}")
+
+
+def _slice_data(data, indices):
+    """Slice data using indices, supporting various formats.
+    
+    Supports:
+    - OpenPI Observation objects (slice all fields)
+    - JAX arrays (native indexing with sharding preservation)
+    - PyTorch tensors (native indexing)
+    - Numpy arrays (native indexing)
+    
+    For JAX arrays, uses native indexing and preserves sharding via device_put.
+    """
+    if hasattr(data, 'state') and hasattr(data, 'images'):
+        # OpenPI Observation object - slice all fields
+        import dataclasses
+        sliced_fields = {}
+        for field in dataclasses.fields(data):
+            value = getattr(data, field.name)
+            if value is None:
+                sliced_fields[field.name] = None
+            elif isinstance(value, dict):
+                # Dict of arrays (e.g., images, image_masks)
+                sliced_dict = {}
+                for k, v in value.items():
+                    sliced_dict[k] = v[indices]
+                sliced_fields[field.name] = sliced_dict
+            else:
+                # Array field
+                sliced_fields[field.name] = value[indices]
+        return type(data)(**sliced_fields)
+    
+    # Tensor/array - direct indexing (works for numpy, torch)
+    return data[indices]
+
+
+def _concat_data(data_list):
+    """Concatenate data from multiple sources, supporting various formats.
+    
+    Supports:
+    - OpenPI Observation objects (concatenate all fields)
+    - JAX arrays (jnp.concatenate with sharding preservation)
+    - PyTorch tensors (torch.cat)
+    - Numpy arrays (np.concatenate)
+    
+    For JAX arrays, uses jnp.concatenate and reapplies sharding via device_put
+    to maintain correct data placement for distributed training.
+    """
+    if not data_list:
+        return None
+    
+    first = data_list[0]
+    
+    if hasattr(first, 'state') and hasattr(first, 'images'):
+        # OpenPI Observation objects - concatenate all fields
+        import dataclasses
+        concat_fields = {}
+        for field in dataclasses.fields(first):
+            values = [getattr(d, field.name) for d in data_list]
+            if values[0] is None:
+                concat_fields[field.name] = None
+            elif isinstance(values[0], dict):
+                # Dict of arrays - concatenate each key
+                concat_dict = {}
+                for k in values[0].keys():
+                    items = [v[k] for v in values]
+                    first_item = items[0]
+                    if _is_jax_array(first_item):
+                        sharding = _get_sharding(first_item)
+                        result = jnp.concatenate(items, axis=0)
+                        concat_dict[k] = _apply_sharding(result, sharding)
+                    elif isinstance(first_item, torch.Tensor):
+                        concat_dict[k] = torch.cat(items, dim=0)
+                    else:
+                        concat_dict[k] = np.concatenate(items, axis=0)
+                concat_fields[field.name] = concat_dict
+            else:
+                # Array field
+                first_val = values[0]
+                if _is_jax_array(first_val):
+                    sharding = _get_sharding(first_val)
+                    result = jnp.concatenate(values, axis=0)
+                    concat_fields[field.name] = _apply_sharding(result, sharding)
+                elif isinstance(first_val, torch.Tensor):
+                    concat_fields[field.name] = torch.cat(values, dim=0)
+                else:
+                    concat_fields[field.name] = np.concatenate(values, axis=0)
+        return type(first)(**concat_fields)
+    
+    # JAX array - jnp.concatenate with sharding preservation
+    if _is_jax_array(first):
+        sharding = _get_sharding(first)
+        result = jnp.concatenate(data_list, axis=0)
+        return _apply_sharding(result, sharding)
+    
+    # PyTorch Tensor
+    if isinstance(first, torch.Tensor):
+        return torch.cat(data_list, dim=0)
+    
+    # Numpy array
+    if isinstance(first, np.ndarray):
+        return np.concatenate(data_list, axis=0)
+    
+    raise TypeError(f"Cannot concatenate data of type {type(first)}")
+
+
 class InBatchMixDataLoader(ComposableDataLoader):
     """Mix samples from multiple DataLoaders within a single batch.
     
-    Useful for contrastive learning or scenarios requiring samples from
-    different sources in every batch.
+    Supports multiple batch formats:
+    - Standard PyTorch: (tensor_data, tensor_labels)
+    - OpenPI format: (Observation, Actions)
+    - Tagged batches: (tag, (data, labels))
     
     Args:
         dataloaders: Sequence of DataLoaders.
         samples_per_loader: Number of samples from each loader per batch.
         total_batch_size: Alternative to samples_per_loader; divided equally.
+        random_sample: If True, randomly sample from each batch when it's larger
+            than needed. If False, take the first N samples. Default False.
     
     Examples:
         >>> # Each batch contains 16 samples from each loader
@@ -753,10 +898,13 @@ class InBatchMixDataLoader(ComposableDataLoader):
         self, 
         dataloaders: Sequence[AnyDataLoader], 
         samples_per_loader: Optional[Sequence[int]] = None,
-        total_batch_size: Optional[int] = None
+        total_batch_size: Optional[int] = None,
+        random_sample: bool = False
     ):
         self.dataloaders = list(dataloaders)
+        self._num_loaders = len(dataloaders)
         self._last_loader_idx: Optional[Union[int, str]] = None
+        self._random_sample = random_sample
         
         if samples_per_loader is None:
             if total_batch_size is None:
@@ -764,7 +912,7 @@ class InBatchMixDataLoader(ComposableDataLoader):
                     getattr(loader, 'batch_size', 32) 
                     for loader in dataloaders
                 )
-            samples_per_loader = [total_batch_size // len(dataloaders)] * len(dataloaders)
+            samples_per_loader = [total_batch_size // self._num_loaders] * self._num_loaders
             samples_per_loader[-1] = total_batch_size - sum(samples_per_loader[:-1])
         
         self.samples_per_loader = list(samples_per_loader)
@@ -775,45 +923,64 @@ class InBatchMixDataLoader(ComposableDataLoader):
         """Get the index of the loader that produced the last batch."""
         return self._last_loader_idx
     
+    @staticmethod
+    def _extract_batch(batch) -> Optional[tuple]:
+        """Extract (data, labels) from various batch formats."""
+        if not isinstance(batch, tuple) or len(batch) != 2:
+            return None
+        first, second = batch
+        # Tagged batch: (tag, (data, labels))
+        if isinstance(first, (int, str)) and isinstance(second, tuple) and len(second) == 2:
+            return second
+        # Regular batch: (data, labels)
+        return batch
+    
     def __iter__(self):
         iterators = [iter(loader) for loader in self.dataloaders]
+        # Pre-allocate lists with fixed size
+        data_parts: list = [None] * self._num_loaders
+        label_parts: list = [None] * self._num_loaders
         
         while True:
-            mixed_batch_data = []
-            mixed_batch_labels = []
-            
-            for idx, num_samples in enumerate(self.samples_per_loader):
+            all_valid = True
+
+            for idx in range(self._num_loaders):
+                num_samples = self.samples_per_loader[idx]
                 try:
                     batch = next(iterators[idx])
+                    extracted = self._extract_batch(batch)
                     
-                    # Handle tagged batches
-                    if isinstance(batch, tuple) and len(batch) == 2:
-                        if isinstance(batch[0], (int, str)):
-                            _, actual_batch = batch
-                            data, labels = actual_batch
+                    if extracted is None:
+                        all_valid = False
+                        break
+                    
+                    data, labels = extracted
+                    batch_size = _get_batch_size(labels)  # Use labels (always an array)
+                    
+                    # Sample from batch when it's larger than needed
+                    if batch_size > num_samples:
+                        if self._random_sample:
+                            indices = _rng.choice(batch_size, size=num_samples, replace=False)
                         else:
-                            data, labels = batch
+                            indices = np.arange(num_samples)
+                        data_parts[idx] = _slice_data(data, indices)
+                        label_parts[idx] = _slice_data(labels, indices)
                     else:
-                        continue
-                    
-                    if len(data) >= num_samples:
-                        mixed_batch_data.append(data[:num_samples])
-                        mixed_batch_labels.append(labels[:num_samples])
-                    else:
-                        mixed_batch_data.append(data)
-                        mixed_batch_labels.append(labels)
+                        data_parts[idx] = data
+                        label_parts[idx] = labels
                         
                 except StopIteration:
                     return
             
-            if mixed_batch_data:
-                combined_data = torch.cat(mixed_batch_data, dim=0)
-                combined_labels = torch.cat(mixed_batch_labels, dim=0)
-                
-                # Shuffle combined batch using module-level RNG
-                indices = torch.from_numpy(_rng.permutation(len(combined_data)))
-                self._last_loader_idx = "mixed"
-                yield combined_data[indices], combined_labels[indices]
+            if not all_valid:
+                continue
+            
+            # Concatenate all parts
+            combined_data = _concat_data(data_parts)
+            combined_labels = _concat_data(label_parts)
+            
+            self._last_loader_idx = "mixed"
+            yield combined_data, combined_labels
     
     def __len__(self):
         return min(len(loader) for loader in self.dataloaders)
@@ -984,10 +1151,11 @@ class Compose:
     @staticmethod
     def inbatch(
         *loaders: AnyDataLoader,
-        samples_per_loader: Optional[Sequence[int]] = None
+        samples_per_loader: Optional[Sequence[int]] = None,
+        random_sample: bool = False
     ) -> InBatchMixDataLoader:
         """Create an in-batch mixing DataLoader."""
-        return InBatchMixDataLoader(list(loaders), samples_per_loader)
+        return InBatchMixDataLoader(list(loaders), samples_per_loader, random_sample=random_sample)
 
 
 # =============================================================================
