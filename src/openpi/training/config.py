@@ -497,6 +497,9 @@ class ComposableDataConfig:
     
     # Task names for tagged strategy (must match number of datasets)
     task_names: Sequence[str] | None = None
+
+    # Whether to tag each batch with its source loader name
+    return_source: bool = False
     
     # Random seed for reproducibility
     seed: int | None = None
@@ -829,6 +832,7 @@ _CONFIGS = [
             ],
             composition_strategy="random",  # Options: "random", "proportional", "round_robin", "tagged", "dynamic"
             weights=[0.6, 0.4],  # 60% from dataset 1, 40% from dataset 2
+            return_source=True,
             seed=42,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/model/pi05_base/params"),

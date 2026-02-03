@@ -653,6 +653,7 @@ class ComposableDataLoaderWrapper:
         self,
         composable_loader: composable.ComposableDataLoader,
         primary_data_config: _config.DataConfig,
+        return_source: bool = False,
     ):
         """Initialize the wrapper.
         
@@ -663,7 +664,8 @@ class ComposableDataLoaderWrapper:
         """
         self._composable_loader = composable_loader
         self._data_config = primary_data_config
-    
+        self._return_source = return_source
+
     def data_config(self) -> _config.DataConfig:
         return self._data_config
     
@@ -674,8 +676,15 @@ class ComposableDataLoaderWrapper:
                 first, second = batch
                 # Tagged batch: (task_name, (Observation, actions))
                 if isinstance(first, str):
-                    _task_name, (obs, actions) = first, second
-                    yield obs, actions
+                    task_name = first
+                    if isinstance(second, tuple) and len(second) == 2:
+                        obs, actions = second
+                    else:
+                        obs, actions = _model.Observation.from_dict(second), second["actions"]
+                    if self._return_source:
+                        yield task_name, (obs, actions)
+                    else:
+                        yield obs, actions
                 # Already processed: (Observation, actions)
                 elif isinstance(first, _model.Observation):
                     yield first, second
@@ -734,6 +743,7 @@ def create_composable_data_loader(
     ratios = composable_config.ratios
     pattern = composable_config.pattern
     task_names = composable_config.task_names
+    return_source = composable_config.return_source
     seed = composable_config.seed
     
     if seed is not None:
@@ -793,6 +803,11 @@ def create_composable_data_loader(
     else:
         raise ValueError(f"Unknown composition strategy: {composition_strategy}")
     
+    if return_source and composition_strategy != "tagged":
+        if task_names is None:
+            task_names = [dc.repo_id or f"dataset_{i}" for i, dc in enumerate(data_configs)]
+        composed = composable.SourceTaggedDataLoader(composed, task_names)
+
     logging.info(f"Created composable data loader with strategy '{composition_strategy}'")
     logging.info(f"  - Number of datasets: {len(individual_loaders)}")
     if weights is not None:
@@ -800,7 +815,7 @@ def create_composable_data_loader(
     if ratios is not None:
         logging.info(f"  - Ratios: {ratios}")
     
-    return ComposableDataLoaderWrapper(composed, primary_data_config)
+    return ComposableDataLoaderWrapper(composed, primary_data_config, return_source=return_source)
 
 
 def _create_single_dataset_config(

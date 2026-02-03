@@ -96,6 +96,7 @@ __all__ = [
     "ProportionalMixDataLoader",
     "AlternatingDataLoader",
     "TaskTaggedDataLoader",
+    "SourceTaggedDataLoader",
     "DynamicScheduleDataLoader",
     "InBatchMixDataLoader",
     "CurriculumDataLoader",
@@ -214,20 +215,34 @@ class RoundRobinDataLoader(ComposableDataLoader):
     def __init__(self, dataloaders: Sequence[AnyDataLoader]):
         self.dataloaders = list(dataloaders)
         self.num_loaders = len(dataloaders)
+        self._last_loader_idx: Optional[int] = None
+
+    @property
+    def last_loader_idx(self) -> Optional[int]:
+        """Get the index of the loader that produced the last batch."""
+        return self._last_loader_idx
     
     def __iter__(self):
         iterators = [iter(loader) for loader in self.dataloaders]
+        # Use boolean mask instead of removing elements (preserves original indices)
+        active = [True] * self.num_loaders
+        active_count = self.num_loaders
         loader_idx = 0
         
-        while iterators:
+        while active_count > 0:
+            # Skip inactive loaders
+            while not active[loader_idx]:
+                loader_idx = (loader_idx + 1) % self.num_loaders
+            
             try:
                 batch = next(iterators[loader_idx])
+                self._last_loader_idx = loader_idx  # Now correctly tracks original index
                 yield batch
-                loader_idx = (loader_idx + 1) % len(iterators)
             except StopIteration:
-                iterators.pop(loader_idx)
-                if iterators:
-                    loader_idx = loader_idx % len(iterators)
+                active[loader_idx] = False
+                active_count -= 1
+            
+            loader_idx = (loader_idx + 1) % self.num_loaders
     
     def __len__(self):
         return sum(len(loader) for loader in self.dataloaders)
@@ -261,26 +276,41 @@ class RandomMixDataLoader(ComposableDataLoader):
         weights: Optional[Sequence[float]] = None
     ):
         self.dataloaders = list(dataloaders)
+        self._last_loader_idx: Optional[int] = None
+        self._num_loaders = len(dataloaders)
         
         if weights is None:
-            weights = [1.0] * len(dataloaders)
+            weights = [1.0] * self._num_loaders
         total = sum(weights)
-        self.weights = np.array([w / total for w in weights])
+        self.weights = np.array([w / total for w in weights], dtype=np.float64)
+
+    @property
+    def last_loader_idx(self) -> Optional[int]:
+        """Get the index of the loader that produced the last batch."""
+        return self._last_loader_idx
     
     def __iter__(self):
         iterators = [iter(loader) for loader in self.dataloaders]
-        active_indices = list(range(len(iterators)))
+        # Use boolean mask + pre-allocated array for efficiency
+        active = np.ones(self._num_loaders, dtype=bool)
+        current_weights = self.weights.copy()  # Reusable buffer
         
-        while active_indices:
-            probs = self.weights[active_indices]
-            probs = probs / probs.sum()
-            idx = _rng.choice(active_indices, p=probs)
+        while active.any():
+            # Compute probs in-place (avoid allocation)
+            np.multiply(self.weights, active, out=current_weights)
+            weight_sum = current_weights.sum()
+            if weight_sum == 0:
+                break
+            current_weights /= weight_sum
+            
+            idx = int(_rng.choice(self._num_loaders, p=current_weights))
             
             try:
                 batch = next(iterators[idx])
+                self._last_loader_idx = idx
                 yield batch
             except StopIteration:
-                active_indices.remove(idx)
+                active[idx] = False
     
     def __len__(self):
         return sum(len(loader) for loader in self.dataloaders)
@@ -295,6 +325,9 @@ class ProportionalMixDataLoader(ComposableDataLoader):
     
     Unlike RandomMixDataLoader which samples probabilistically, this loader
     guarantees exact batch counts per loader based on the specified ratios.
+    
+    Uses an efficient online sampling algorithm (O(1) memory per step) instead
+    of pre-generating the full schedule.
     
     Args:
         dataloaders: Sequence of DataLoaders.
@@ -317,40 +350,57 @@ class ProportionalMixDataLoader(ComposableDataLoader):
         max_batches: Optional[int] = None
     ):
         self.dataloaders = list(dataloaders)
+        self._last_loader_idx: Optional[int] = None
         
         if ratios is None:
             ratios = [1.0] * len(dataloaders)
         
         total_batches = max_batches or sum(len(loader) for loader in dataloaders)
-        ratios = np.array(ratios) / sum(ratios)
-        self.batches_per_loader = (ratios * total_batches).astype(int)
+        ratios_arr = np.array(ratios) / sum(ratios)
+        self.batches_per_loader = (ratios_arr * total_batches).astype(int)
         
         # Distribute remainder to last loader
         diff = total_batches - self.batches_per_loader.sum()
         if diff > 0:
             self.batches_per_loader[-1] += diff
+        
+        self._total_batches = int(self.batches_per_loader.sum())
+
+    @property
+    def last_loader_idx(self) -> Optional[int]:
+        """Get the index of the loader that produced the last batch."""
+        return self._last_loader_idx
     
     def __iter__(self):
         iterators = [iter(loader) for loader in self.dataloaders]
+        num_loaders = len(self.dataloaders)
         
-        # Build shuffled schedule
-        schedule = []
-        for idx, num_batches in enumerate(self.batches_per_loader):
-            schedule.extend([idx] * num_batches)
-        _rng.shuffle(schedule)
+        # Use counters instead of pre-generating full schedule (memory efficient)
+        remaining = self.batches_per_loader.astype(np.float64)  # Use float for in-place ops
+        probs = np.empty(num_loaders, dtype=np.float64)  # Reusable buffer
         
-        for loader_idx in schedule:
+        for _ in range(self._total_batches):
+            # Compute probs in-place (avoid allocation)
+            total = remaining.sum()
+            if total <= 0:
+                break
+            np.divide(remaining, total, out=probs)
+            
+            loader_idx = int(_rng.choice(num_loaders, p=probs))
+            remaining[loader_idx] -= 1
+            
             try:
                 batch = next(iterators[loader_idx])
-                yield batch
             except StopIteration:
                 # Restart exhausted loader
                 iterators[loader_idx] = iter(self.dataloaders[loader_idx])
                 batch = next(iterators[loader_idx])
-                yield batch
+            
+            self._last_loader_idx = loader_idx
+            yield batch
     
     def __len__(self):
-        return int(self.batches_per_loader.sum())
+        return self._total_batches
 
 
 # =============================================================================
@@ -379,6 +429,12 @@ class AlternatingDataLoader(ComposableDataLoader):
     ):
         self.dataloaders = list(dataloaders)
         self.pattern = list(pattern) if pattern else list(range(len(dataloaders)))
+        self._last_loader_idx: Optional[int] = None
+
+    @property
+    def last_loader_idx(self) -> Optional[int]:
+        """Get the index of the loader that produced the last batch."""
+        return self._last_loader_idx
     
     def __iter__(self):
         iterators = [iter(loader) for loader in self.dataloaders]
@@ -391,6 +447,7 @@ class AlternatingDataLoader(ComposableDataLoader):
             loader_idx = next(pattern_cycle)
             try:
                 batch = next(iterators[loader_idx])
+                self._last_loader_idx = loader_idx
                 yield batch
                 batches_yielded += 1
             except StopIteration:
@@ -433,8 +490,16 @@ class TaskTaggedDataLoader(ComposableDataLoader):
     ):
         self.dataloaders = dataloaders
         self.task_names = list(dataloaders.keys())
+        # O(1) lookup for task -> index
+        self._task_to_idx = {name: i for i, name in enumerate(self.task_names)}
         self.sampling_strategy = sampling_strategy
         self.propagate_tags = propagate_tags
+        self._last_loader_idx: Optional[int] = None
+
+    @property
+    def last_loader_idx(self) -> Optional[int]:
+        """Get the index of the loader that produced the last batch."""
+        return self._last_loader_idx
     
     def __iter__(self):
         iterators = {name: iter(loader) for name, loader in self.dataloaders.items()}
@@ -442,20 +507,31 @@ class TaskTaggedDataLoader(ComposableDataLoader):
         if self.sampling_strategy == 'round_robin':
             task_cycle = itertools.cycle(self.task_names)
         
-        active_tasks = set(self.task_names)
+        # Use list for O(1) random access, track active via boolean
+        num_tasks = len(self.task_names)
+        active = [True] * num_tasks
+        active_count = num_tasks
+        # Cache for random sampling (avoid repeated list creation)
+        active_list = self.task_names.copy()
         
-        while active_tasks:
+        while active_count > 0:
             if self.sampling_strategy == 'random':
-                task = _rng.choice(list(active_tasks))
+                # Use cached list, only rebuild when needed
+                task = str(_rng.choice(active_list))
             elif self.sampling_strategy == 'round_robin':
                 task = next(task_cycle)
-                while task not in active_tasks:
+                task_idx = self._task_to_idx[task]
+                while not active[task_idx]:
                     task = next(task_cycle)
+                    task_idx = self._task_to_idx[task]
             else:
                 raise ValueError(f"Unknown sampling strategy: {self.sampling_strategy}")
             
+            task_idx = self._task_to_idx[task]
+            
             try:
                 batch = next(iterators[task])
+                self._last_loader_idx = task_idx  # O(1) lookup
                 
                 # Handle nested tagged batches
                 if self.propagate_tags and isinstance(batch, tuple) and len(batch) == 2:
@@ -468,10 +544,51 @@ class TaskTaggedDataLoader(ComposableDataLoader):
                     yield task, batch
                     
             except StopIteration:
-                active_tasks.remove(task)
+                active[task_idx] = False
+                active_count -= 1
+                # Rebuild active_list only when a task is exhausted
+                active_list = [self.task_names[i] for i in range(num_tasks) if active[i]]
     
     def __len__(self):
         return sum(len(loader) for loader in self.dataloaders.values())
+
+
+# =============================================================================
+# Source-Tagged Wrapper
+# =============================================================================
+
+class SourceTaggedDataLoader(ComposableDataLoader):
+    """Wrap a DataLoader and tag each batch with its source name.
+    
+    The wrapped loader must expose a `last_loader_idx` attribute/property.
+    """
+
+    def __init__(self, dataloader: ComposableDataLoader, source_names: Sequence[str]):
+        self.dataloader = dataloader
+        self.source_names = list(source_names)
+
+    def _resolve_source_name(self, idx: Optional[Union[int, str]]) -> str:
+        if isinstance(idx, str):
+            return idx
+        if isinstance(idx, int) and 0 <= idx < len(self.source_names):
+            return self.source_names[idx]
+        if idx is None:
+            return "unknown"
+        return f"dataset_{idx}"
+
+    def __iter__(self):
+        for batch in self.dataloader:
+            # Pass through if already tagged
+            if isinstance(batch, tuple) and len(batch) == 2 and isinstance(batch[0], (int, str)):
+                yield batch
+                continue
+
+            idx = getattr(self.dataloader, "last_loader_idx", None)
+            source_name = self._resolve_source_name(idx)
+            yield source_name, batch
+
+    def __len__(self):
+        return len(self.dataloader)
 
 
 # =============================================================================
@@ -566,13 +683,22 @@ class DynamicScheduleDataLoader(ComposableDataLoader):
     
     def __iter__(self):
         iterators = [iter(loader) for loader in self.dataloaders]
-        active_indices = list(range(len(iterators)))
+        num_loaders = len(self.dataloaders)
         self._last_loader_idx = None
         
-        while active_indices:
-            probs = self.weights[active_indices]
-            probs = probs / probs.sum()
-            idx = _rng.choice(active_indices, p=probs)
+        # Use boolean mask for O(1) deactivation
+        active = np.ones(num_loaders, dtype=bool)
+        current_weights = np.empty(num_loaders, dtype=np.float64)  # Reusable buffer
+        
+        while active.any():
+            # Compute probs in-place
+            np.multiply(self.weights, active, out=current_weights)
+            weight_sum = current_weights.sum()
+            if weight_sum == 0:
+                break
+            current_weights /= weight_sum
+            
+            idx = int(_rng.choice(num_loaders, p=current_weights))
             
             try:
                 batch = next(iterators[idx])
@@ -581,7 +707,7 @@ class DynamicScheduleDataLoader(ComposableDataLoader):
                     self.batches_from_loader[idx] += 1
                 yield batch
             except StopIteration:
-                active_indices.remove(idx)
+                active[idx] = False
     
     def __len__(self):
         return sum(len(loader) for loader in self.dataloaders)
@@ -630,6 +756,7 @@ class InBatchMixDataLoader(ComposableDataLoader):
         total_batch_size: Optional[int] = None
     ):
         self.dataloaders = list(dataloaders)
+        self._last_loader_idx: Optional[Union[int, str]] = None
         
         if samples_per_loader is None:
             if total_batch_size is None:
@@ -642,6 +769,11 @@ class InBatchMixDataLoader(ComposableDataLoader):
         
         self.samples_per_loader = list(samples_per_loader)
         self.total_batch_size = sum(samples_per_loader)
+
+    @property
+    def last_loader_idx(self) -> Optional[Union[int, str]]:
+        """Get the index of the loader that produced the last batch."""
+        return self._last_loader_idx
     
     def __iter__(self):
         iterators = [iter(loader) for loader in self.dataloaders]
@@ -680,6 +812,7 @@ class InBatchMixDataLoader(ComposableDataLoader):
                 
                 # Shuffle combined batch using module-level RNG
                 indices = torch.from_numpy(_rng.permutation(len(combined_data)))
+                self._last_loader_idx = "mixed"
                 yield combined_data[indices], combined_labels[indices]
     
     def __len__(self):
@@ -729,6 +862,12 @@ class CurriculumDataLoader(ComposableDataLoader):
         self.batches_per_stage = list(batches_per_stage)
         self.current_stage = 0
         self.batches_in_stage = 0
+        self._last_loader_idx: Optional[int] = None
+
+    @property
+    def last_loader_idx(self) -> Optional[int]:
+        """Get the index of the loader that produced the last batch."""
+        return self._last_loader_idx
     
     def __iter__(self):
         iterators = [iter(loader) for loader in self.dataloaders]
@@ -741,6 +880,7 @@ class CurriculumDataLoader(ComposableDataLoader):
             
             try:
                 batch = next(iterators[loader_idx])
+                self._last_loader_idx = loader_idx
                 yield batch
                 batches_yielded += 1
                 self.batches_in_stage += 1
