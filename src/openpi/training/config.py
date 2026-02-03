@@ -482,12 +482,12 @@ class ComposableDataConfig:
     
     Supported strategies:
         - "random": Sample from loaders with optional weights
-        - "proportional": Fixed ratio allocation of batches
+        - "proportional": Fixed ratio allocation of batches (ratios=weights)
         - "round_robin": Cycle through loaders sequentially
         - "alternating": Custom pattern-based alternation
         - "tagged": Add source labels to batches
         - "dynamic": Adjust weights based on training feedback
-        - "inbatch": Mix samples from multiple loaders within a single batch
+        - "inbatch": Mix samples within a single batch (samples_per_loader=weights*batch_size)
     """
     # List of data config factories for each dataset
     dataset_configs: Sequence[DataConfigFactory] = ()
@@ -495,11 +495,8 @@ class ComposableDataConfig:
     # Composition strategy
     composition_strategy: str = "random"
     
-    # Weights for random mixing (must match number of datasets)
+    # Weights: for random/proportional use as-is; for inbatch, samples_per_loader = weights * batch_size (normalized)
     weights: Sequence[float] | None = None
-    
-    # Ratios for proportional mixing (must match number of datasets)
-    ratios: Sequence[float] | None = None
     
     # Pattern for alternating strategy (indices into dataset_configs)
     pattern: Sequence[int] | None = None
@@ -509,10 +506,6 @@ class ComposableDataConfig:
 
     # Whether to tag each batch with its source loader name
     return_source: bool = False
-    
-    # Samples per loader for inbatch mixing (must match number of datasets)
-    # If None, samples are divided equally based on total_batch_size
-    samples_per_loader: Sequence[int] | None = None
     
     # Whether to randomly sample from each batch (for inbatch strategy)
     # If True, randomly selects samples; if False, takes first N samples
