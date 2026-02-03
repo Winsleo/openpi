@@ -28,6 +28,22 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
 
+def _unwrap_batch(batch: tuple) -> tuple[str | None, tuple[_model.Observation, _model.Actions]]:
+    """Unwrap a possibly source-tagged batch.
+
+    Returns:
+        (source_name, (observation, actions))
+    """
+    if (
+        isinstance(batch, tuple)
+        and len(batch) == 2
+        and isinstance(batch[0], (str, int))
+        and isinstance(batch[1], tuple)
+        and len(batch[1]) == 2
+    ):
+        return str(batch[0]), batch[1]
+    return None, batch
+
 # ============== Validation Functions ==============
 
 def _extract_training_norm_stats(train_data_loader: _data_loader.DataLoader | None) -> dict | None:
@@ -444,12 +460,13 @@ def main(config: _config.TrainConfig):
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
-    logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+    _, (init_obs, init_actions) = _unwrap_batch(batch)
+    logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info((init_obs, init_actions))}")
 
     # Log images from first batch to sanity check.
     images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        wandb.Image(np.concatenate([np.array(img[i]) for img in init_obs.images.values()], axis=1))
+        for i in range(min(5, len(next(iter(init_obs.images.values())))))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
 
@@ -514,6 +531,9 @@ def main(config: _config.TrainConfig):
 
     infos = []
     for step in pbar:
+        source, (observation, actions) = _unwrap_batch(batch)
+        if source is not None:
+            pbar.write(f"Step {step}: data_source={source}")
         with sharding.set_mesh(mesh):
             if grad_accum_steps > 1:
                 # Gradient accumulation mode
@@ -521,7 +541,7 @@ def main(config: _config.TrainConfig):
                 accumulated_infos = []
 
                 for accum_step in range(grad_accum_steps):
-                    grads, grad_info = pcompute_grads(train_rng, train_state, batch)
+                    grads, grad_info = pcompute_grads(train_rng, train_state, (observation, actions))
                     accumulated_infos.append(grad_info)
 
                     # Accumulate gradients (average across accumulation steps)
@@ -535,6 +555,7 @@ def main(config: _config.TrainConfig):
                     # Get next batch for accumulation (except for last step)
                     if accum_step < grad_accum_steps - 1:
                         batch = next(data_iter)
+                        source, (observation, actions) = _unwrap_batch(batch)
 
                 # Average the accumulated gradients
                 accumulated_grads = jax.tree.map(
@@ -553,7 +574,7 @@ def main(config: _config.TrainConfig):
                 }
             else:
                 # Standard single-step training
-                train_state, info = ptrain_step(train_rng, train_state, batch)
+                train_state, info = ptrain_step(train_rng, train_state, (observation, actions))
 
         infos.append(info)
         if step % config.log_interval == 0:
