@@ -28,41 +28,13 @@ Example:
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 import itertools
-from typing import Dict, Optional, Protocol, Sequence, TypeVar, Union, runtime_checkable
-
-import jax
-import jax.numpy as jnp
+from typing import Dict, Optional, Protocol, TypeVar, Union, runtime_checkable
 import numpy as np
 import torch
 from torch.utils.data import DataLoader as TorchDataLoader, Dataset as TorchDataset
-
-
-def _is_jax_array(x) -> bool:
-    """Check if x is a JAX array."""
-    return hasattr(x, 'device') and hasattr(x, 'sharding') and hasattr(x, 'at')
-
-
-def _get_sharding(data):
-    """Extract sharding from a JAX array.
-    
-    Returns the sharding object if available, None otherwise.
-    """
-    if _is_jax_array(data) and hasattr(data, 'sharding'):
-        return data.sharding
-    return None
-
-
-def _apply_sharding(data, sharding):
-    """Apply sharding to data using jax.device_put.
-    
-    This is used to restore correct sharding after JAX operations
-    like concatenation that may lose sharding information.
-    """
-    if sharding is not None:
-        return jax.device_put(data, sharding)
-    return data
+from openpi.training.pytree_utils import slice_data, concat_data
 
 
 # =============================================================================
@@ -767,110 +739,7 @@ def _get_batch_size(data) -> int:
     raise TypeError(f"Cannot determine batch size for type {type(data)}")
 
 
-def _slice_data(data, indices):
-    """Slice data using indices, supporting various formats.
-    
-    Supports:
-    - OpenPI Observation objects (slice all fields)
-    - JAX arrays (native indexing with sharding preservation)
-    - PyTorch tensors (native indexing)
-    - Numpy arrays (native indexing)
-    
-    For JAX arrays, uses native indexing and preserves sharding via device_put.
-    """
-    if hasattr(data, 'state') and hasattr(data, 'images'):
-        # OpenPI Observation object - slice all fields
-        import dataclasses
-        sliced_fields = {}
-        for field in dataclasses.fields(data):
-            value = getattr(data, field.name)
-            if value is None:
-                sliced_fields[field.name] = None
-            elif isinstance(value, dict):
-                # Dict of arrays (e.g., images, image_masks)
-                sliced_dict = {}
-                for k, v in value.items():
-                    sliced_dict[k] = v[indices]
-                sliced_fields[field.name] = sliced_dict
-            else:
-                # Array field
-                sliced_fields[field.name] = value[indices]
-        return type(data)(**sliced_fields)
-    
-    # Tensor/array - direct indexing (works for numpy, torch)
-    return data[indices]
-
-
-def _concat_data(data_list):
-    """Concatenate data from multiple sources, supporting various formats.
-    
-    Supports:
-    - OpenPI Observation objects (concatenate all fields)
-    - JAX arrays (jnp.concatenate with sharding preservation)
-    - PyTorch tensors (torch.cat)
-    - Numpy arrays (np.concatenate)
-    
-    For JAX arrays, uses jnp.concatenate and reapplies sharding via device_put
-    to maintain correct data placement for distributed training.
-    """
-    if not data_list:
-        return None
-    
-    first = data_list[0]
-    
-    if hasattr(first, 'state') and hasattr(first, 'images'):
-        # OpenPI Observation objects - concatenate all fields
-        import dataclasses
-        concat_fields = {}
-        for field in dataclasses.fields(first):
-            values = [getattr(d, field.name) for d in data_list]
-            if values[0] is None:
-                concat_fields[field.name] = None
-            elif isinstance(values[0], dict):
-                # Dict of arrays - concatenate each key
-                concat_dict = {}
-                for k in values[0].keys():
-                    items = [v[k] for v in values]
-                    first_item = items[0]
-                    if _is_jax_array(first_item):
-                        sharding = _get_sharding(first_item)
-                        result = jnp.concatenate(items, axis=0)
-                        concat_dict[k] = _apply_sharding(result, sharding)
-                    elif isinstance(first_item, torch.Tensor):
-                        concat_dict[k] = torch.cat(items, dim=0)
-                    else:
-                        concat_dict[k] = np.concatenate(items, axis=0)
-                concat_fields[field.name] = concat_dict
-            else:
-                # Array field
-                first_val = values[0]
-                if _is_jax_array(first_val):
-                    sharding = _get_sharding(first_val)
-                    result = jnp.concatenate(values, axis=0)
-                    concat_fields[field.name] = _apply_sharding(result, sharding)
-                elif isinstance(first_val, torch.Tensor):
-                    concat_fields[field.name] = torch.cat(values, dim=0)
-                else:
-                    concat_fields[field.name] = np.concatenate(values, axis=0)
-        return type(first)(**concat_fields)
-    
-    # JAX array - jnp.concatenate with sharding preservation
-    if _is_jax_array(first):
-        sharding = _get_sharding(first)
-        result = jnp.concatenate(data_list, axis=0)
-        return _apply_sharding(result, sharding)
-    
-    # PyTorch Tensor
-    if isinstance(first, torch.Tensor):
-        return torch.cat(data_list, dim=0)
-    
-    # Numpy array
-    if isinstance(first, np.ndarray):
-        return np.concatenate(data_list, axis=0)
-    
-    raise TypeError(f"Cannot concatenate data of type {type(first)}")
-
-
+from openpi.training.pytree_utils import contains_jax_array
 class InBatchMixDataLoader(ComposableDataLoader):
     """Mix samples from multiple DataLoaders within a single batch.
     
@@ -905,6 +774,11 @@ class InBatchMixDataLoader(ComposableDataLoader):
         self._num_loaders = len(dataloaders)
         self._last_loader_idx: Optional[Union[int, str]] = None
         self._random_sample = random_sample
+        # Prefer sharding from a loader that has _sharding (unified across mixed batch)
+        self._sharding = next(
+            (getattr(ld, "sharding", None) for ld in self.dataloaders if getattr(ld, "sharding", None) is not None),
+            None,
+        )
         
         if samples_per_loader is None:
             if total_batch_size is None:
@@ -940,7 +814,7 @@ class InBatchMixDataLoader(ComposableDataLoader):
         # Pre-allocate lists with fixed size
         data_parts: list = [None] * self._num_loaders
         label_parts: list = [None] * self._num_loaders
-        
+
         while True:
             all_valid = True
 
@@ -953,8 +827,9 @@ class InBatchMixDataLoader(ComposableDataLoader):
                     if extracted is None:
                         all_valid = False
                         break
-                    
+
                     data, labels = extracted
+
                     batch_size = _get_batch_size(labels)  # Use labels (always an array)
                     
                     # Sample from batch when it's larger than needed
@@ -963,8 +838,8 @@ class InBatchMixDataLoader(ComposableDataLoader):
                             indices = _rng.choice(batch_size, size=num_samples, replace=False)
                         else:
                             indices = np.arange(num_samples)
-                        data_parts[idx] = _slice_data(data, indices)
-                        label_parts[idx] = _slice_data(labels, indices)
+                        data_parts[idx] = slice_data(data, indices)
+                        label_parts[idx] = slice_data(labels, indices)
                     else:
                         data_parts[idx] = data
                         label_parts[idx] = labels
@@ -974,10 +849,13 @@ class InBatchMixDataLoader(ComposableDataLoader):
             
             if not all_valid:
                 continue
-            
+            from openpi.training.pytree_utils import apply_sharding
             # Concatenate all parts
-            combined_data = _concat_data(data_parts)
-            combined_labels = _concat_data(label_parts)
+            combined_data = concat_data(data_parts)
+            combined_labels = concat_data(label_parts)
+            if self._sharding is not None:
+                combined_data = apply_sharding(combined_data, self._sharding)
+                combined_labels = apply_sharding(combined_labels, self._sharding)
             
             self._last_loader_idx = "mixed"
             yield combined_data, combined_labels

@@ -637,6 +637,10 @@ class DataLoaderImpl(DataLoader):
     def __len__(self) -> int:
         return len(self._data_loader)
 
+    @property
+    def sharding(self) -> jax.sharding.Sharding | None:
+        return getattr(self._data_loader, "_sharding", None)
+
 
 # =============================================================================
 # Composable DataLoader Support
@@ -815,6 +819,7 @@ def create_composable_data_loader(
             # Equal split: weights * batch_size with uniform weights
             samples_per_loader = [batch_size // num_loaders] * num_loaders
             samples_per_loader[-1] += batch_size - sum(samples_per_loader)
+        logging.info(f"num_loaders: {num_loaders}, batch_size: {batch_size}, samples_per_loader: {samples_per_loader}")
         composed = composable.Compose.inbatch(
             *individual_loaders,
             samples_per_loader=samples_per_loader,

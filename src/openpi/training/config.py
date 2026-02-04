@@ -821,6 +821,10 @@ _CONFIGS = [
                 # Dataset 1: First subset of B1K demos
                 LeRobotB1KDataConfig(
                     repo_id="behavior-1k/2025-challenge-demos",
+                    assets=AssetsConfig(
+                        assets_dir="/model/pi05_base/assets",
+                        asset_id="behavior-1k/2025-challenge-demos",
+                    ),
                     base_config=DataConfig(
                         prompt_from_task=True,
                         episodes_index=list(range(100)),  # Episodes 0-99
@@ -830,6 +834,10 @@ _CONFIGS = [
                 # Dataset 2: Second subset of B1K demos
                 LeRobotB1KDataConfig(
                     repo_id="behavior-1k/2025-challenge-demos",
+                    assets=AssetsConfig(
+                        assets_dir="/model/pi05_base/assets",
+                        asset_id="behavior-1k/2025-challenge-demos",
+                    ),
                     base_config=DataConfig(
                         prompt_from_task=True,
                         episodes_index=list(range(100, 190)),  # Episodes 100-189
@@ -840,7 +848,7 @@ _CONFIGS = [
                 # Dataset 3: Another LeRobot dataset
                 # LeRobotAlohaDataConfig(repo_id="other/dataset", ...),
             ],
-            composition_strategy="random",  # Options: "random", "proportional", "round_robin", "tagged", "dynamic"
+            composition_strategy="inbatch",  # Options: "random", "proportional", "round_robin", "tagged", "dynamic", "inbatch"
             weights=[0.6, 0.4],  # 60% from dataset 1, 40% from dataset 2
             return_source=True,
             seed=42,
