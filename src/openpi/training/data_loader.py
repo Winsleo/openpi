@@ -703,6 +703,125 @@ class ComposableDataLoaderWrapper:
         return len(self._composable_loader)
 
 
+def _build_composable_from_node(
+    config: _config.TrainConfig,
+    node: _config.ComposableNode,
+    *,
+    sharding: jax.sharding.Sharding | None,
+    shuffle: bool,
+    skip_norm_stats: bool,
+    num_batches: int | None,
+) -> tuple[composable.BaseDataLoader, _config.DataConfig]:
+    """Recursively build a composable loader from a config node (dataset or nested composition).
+    
+    Returns:
+        (loader, primary_data_config) where primary_data_config is from the first leaf.
+    """
+    if isinstance(node, _config.DataConfigFactory):
+        data_config = node.create(config.assets_dirs, config.model)
+        train_config = _create_single_dataset_config(config, node)
+        loader = create_data_loader(
+            train_config,
+            data_config=data_config,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=None,
+            skip_norm_stats=skip_norm_stats,
+        )
+        return loader, data_config
+
+    # node is ComposableDataConfig
+    inputs = node.children
+    if not inputs:
+        raise ValueError("ComposableDataConfig has no children")
+
+    child_loaders: list[composable.BaseDataLoader] = []
+    primary_data_config: _config.DataConfig | None = None
+
+    for i, child in enumerate(inputs):
+        sub_loader, sub_data_config = _build_composable_from_node(
+            config,
+            child,
+            sharding=sharding,
+            shuffle=shuffle,
+            skip_norm_stats=skip_norm_stats,
+            num_batches=None,
+        )
+        child_loaders.append(sub_loader)
+        if primary_data_config is None:
+            primary_data_config = sub_data_config
+        if isinstance(child, _config.DataConfigFactory):
+            logging.info(f"Created data loader {i} for {sub_data_config.repo_id}")
+
+    strategy = node.composition_strategy
+    weights = node.weights
+    pattern = node.pattern
+    task_names = node.task_names
+    num_loaders = len(child_loaders)
+
+    if strategy == "random":
+        composed = composable.Compose.random(*child_loaders, weights=weights)
+    elif strategy == "proportional":
+        composed = composable.Compose.proportional(
+            *child_loaders,
+            ratios=weights,
+            max_batches=num_batches,
+        )
+    elif strategy == "round_robin":
+        composed = composable.Compose.round_robin(*child_loaders)
+    elif strategy == "alternating":
+        composed = composable.Compose.alternating(*child_loaders, pattern=pattern)
+    elif strategy == "tagged":
+        if task_names is None:
+            task_names = [
+                (getattr(c, "repo_id", None) or f"dataset_{i}")
+                if isinstance(c, _config.DataConfigFactory)
+                else f"group_{i}"
+                for i, c in enumerate(inputs)
+            ]
+        loaders_dict = dict(zip(task_names, child_loaders))
+        composed = composable.Compose.tagged(loaders_dict, sampling_strategy="random")
+    elif strategy == "dynamic":
+        composed = composable.Compose.dynamic(*child_loaders, initial_weights=weights)
+    elif strategy == "inbatch":
+        batch_size = config.batch_size
+        if weights is not None:
+            w = np.array(weights, dtype=np.float64) / sum(weights)
+            samples_per_loader = (w * batch_size).astype(np.int64)
+            diff = batch_size - int(samples_per_loader.sum())
+            if diff != 0:
+                samples_per_loader[-1] += diff
+            samples_per_loader = samples_per_loader.tolist()
+        else:
+            samples_per_loader = [batch_size // num_loaders] * num_loaders
+            samples_per_loader[-1] += batch_size - sum(samples_per_loader)
+        logging.info(
+            f"inbatch: num_loaders={num_loaders}, batch_size={batch_size}, "
+            f"samples_per_loader={samples_per_loader}"
+        )
+        composed = composable.Compose.inbatch(
+            *child_loaders,
+            samples_per_loader=samples_per_loader,
+            random_sample=node.inbatch_random_sample,
+        )
+    else:
+        raise ValueError(f"Unknown composition strategy: {strategy}")
+
+    assert primary_data_config is not None
+    return composed, primary_data_config
+
+
+def _default_source_names(inputs: Sequence[_config.ComposableNode]) -> list[str]:
+    """Derive default source names from child nodes."""
+    names = []
+    for i, node in enumerate(inputs):
+        if isinstance(node, _config.DataConfigFactory):
+            names.append(getattr(node, "repo_id", None) or f"dataset_{i}")
+        else:
+            names.append(f"group_{i}")
+    return names
+
+
 def create_composable_data_loader(
     config: _config.TrainConfig,
     composable_config: _config.ComposableDataConfig,
@@ -712,132 +831,66 @@ def create_composable_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
-    """Create a composable data loader that combines multiple datasets.
-    
-    This function creates individual DataLoaders for each dataset configuration
-    and then combines them using the specified composition strategy.
-    
+    """Create a composable data loader that combines multiple datasets (with nesting).
+
+    Builds the loader tree recursively from ``ComposableDataConfig``:
+    each node is either a dataset leaf (``DataConfigFactory``) or a nested
+    ``ComposableDataConfig`` with its own children.
+
     Args:
-        config: The training configuration (provides model config, batch size, etc.).
-        composable_config: ComposableDataConfig containing all mixing settings:
-            - dataset_configs: Sequence of DataConfigFactory instances
-            - composition_strategy: "random", "proportional", "round_robin", 
-              "alternating", "tagged", "dynamic", or "inbatch"
-            - weights: For random/proportional used as-is; for inbatch,
-              samples_per_loader = weights * batch_size (normalized)
-            - pattern, task_names, inbatch_random_sample, seed: Other options
-        sharding: JAX sharding for the data loader.
-        shuffle: Whether to shuffle individual datasets.
-        num_batches: Total number of batches. If None, uses sum of dataset lengths.
-        skip_norm_stats: Whether to skip data normalization.
-        
+        config: Training configuration.
+        composable_config: Root node config, including children / strategy / weights.
+        sharding: Optional JAX sharding for distributed loading.
+        shuffle: Whether to shuffle at the leaf dataset level.
+        num_batches: Optional total batch count for proportional strategy at root.
+        skip_norm_stats: Whether to skip normalization statistics.
+
     Returns:
-        A DataLoader that yields combined batches from all datasets.
-        
-    Examples:
+        A composed ``DataLoader`` instance.
+
+    Example:
         >>> composable_cfg = ComposableDataConfig(
-        ...     dataset_configs=[dataset_config_a, dataset_config_b],
-        ...     composition_strategy="random",
-        ...     weights=[0.7, 0.3],
+        ...     composition_strategy="proportional",
+        ...     children=[
+        ...         ComposableDataConfig(
+        ...             composition_strategy="random",
+        ...             children=[dataset_a, dataset_b],
+        ...             weights=[0.6, 0.4],
+        ...         ),
+        ...         dataset_c,
+        ...     ],
+        ...     weights=[2, 1],
         ... )
         >>> loader = create_composable_data_loader(config, composable_cfg)
     """
-    # Extract settings from composable_config
-    dataset_configs = composable_config.dataset_configs
-    composition_strategy = composable_config.composition_strategy
-    weights = composable_config.weights
-    pattern = composable_config.pattern
-    task_names = composable_config.task_names
     seed = composable_config.seed
     return_source = composable_config.return_source
-    
     if seed is not None:
         composable.set_seed(seed)
-    
-    # Create individual data loaders for each dataset
-    individual_loaders = []
-    data_configs = []
-    
-    for i, dataset_config_factory in enumerate(dataset_configs):
-        # Create the DataConfig from the factory
-        data_config = dataset_config_factory.create(config.assets_dirs, config.model)
-        data_configs.append(data_config)
-        
-        # Create a modified config for this dataset
-        dataset_train_config = _create_single_dataset_config(config, dataset_config_factory)
-        
-        # Create the data loader for this dataset
-        loader = create_data_loader(
-            dataset_train_config,
-            data_config=data_config,
-            sharding=sharding,
-            shuffle=shuffle,
-            num_batches=None,  # Don't limit individual loaders
-            skip_norm_stats=skip_norm_stats,
-        )
-        individual_loaders.append(loader)
-        logging.info(f"Created data loader {i} for {data_config.repo_id}")
-    
-    # Use the first data config as the primary config
-    primary_data_config = data_configs[0]
-    
-    # Create the composed loader based on strategy
-    if composition_strategy == "random":
-        composed = composable.Compose.random(*individual_loaders, weights=weights)
-    elif composition_strategy == "proportional":
-        composed = composable.Compose.proportional(
-            *individual_loaders,
-            ratios=weights,
-            max_batches=num_batches
-        )
-    elif composition_strategy == "round_robin":
-        composed = composable.Compose.round_robin(*individual_loaders)
-    elif composition_strategy == "alternating":
-        composed = composable.Compose.alternating(*individual_loaders, pattern=pattern)
-    elif composition_strategy == "tagged":
-        # Create task names if not provided
-        if task_names is None:
-            task_names = [
-                dc.repo_id or f"dataset_{i}" 
-                for i, dc in enumerate(data_configs)
-            ]
-        loaders_dict = dict(zip(task_names, individual_loaders))
-        composed = composable.Compose.tagged(loaders_dict, sampling_strategy="random")
-    elif composition_strategy == "dynamic":
-        composed = composable.Compose.dynamic(*individual_loaders, initial_weights=weights)
-    elif composition_strategy == "inbatch":
-        batch_size = config.batch_size
-        num_loaders = len(individual_loaders)
-        if weights is not None:
-            w = np.array(weights, dtype=np.float64) / sum(weights)
-            samples_per_loader = (w * batch_size).astype(np.int64)
-            diff = batch_size - int(samples_per_loader.sum())
-            if diff != 0:
-                samples_per_loader[-1] += diff
-            samples_per_loader = samples_per_loader.tolist()
-        else:
-            # Equal split: weights * batch_size with uniform weights
-            samples_per_loader = [batch_size // num_loaders] * num_loaders
-            samples_per_loader[-1] += batch_size - sum(samples_per_loader)
-        logging.info(f"num_loaders: {num_loaders}, batch_size: {batch_size}, samples_per_loader: {samples_per_loader}")
-        composed = composable.Compose.inbatch(
-            *individual_loaders,
-            samples_per_loader=samples_per_loader,
-            random_sample=composable_config.inbatch_random_sample,
-        )
-    else:
-        raise ValueError(f"Unknown composition strategy: {composition_strategy}")
 
-    if return_source and composition_strategy != "tagged":
+    composed, primary_data_config = _build_composable_from_node(
+        config,
+        composable_config,
+        sharding=sharding,
+        shuffle=shuffle,
+        skip_norm_stats=skip_norm_stats,
+        num_batches=num_batches,
+    )
+
+    inputs = composable_config.children
+    strategy = composable_config.composition_strategy
+    task_names = composable_config.task_names
+
+    if return_source and strategy != "tagged":
         if task_names is None:
-            task_names = [dc.repo_id or f"dataset_{i}" for i, dc in enumerate(data_configs)]
+            task_names = _default_source_names(inputs)
         composed = composable.SourceTaggedDataLoader(composed, task_names)
-    
-    logging.info(f"Created composable data loader with strategy '{composition_strategy}'")
-    logging.info(f"  - Number of datasets: {len(individual_loaders)}")
-    if weights is not None:
-        logging.info(f"  - Weights: {weights}")
-    
+
+    logging.info(f"Created composable data loader (strategy at root: '{strategy}')")
+    logging.info(f"  - Root inputs: {len(inputs)}")
+    if composable_config.weights is not None:
+        logging.info(f"  - Weights: {composable_config.weights}")
+
     return ComposableDataLoaderWrapper(composed, primary_data_config, return_source=return_source)
 
 
