@@ -559,33 +559,55 @@ class TaskTaggedDataLoader(ComposableDataLoader):
 
 class SourceTaggedDataLoader(ComposableDataLoader):
     """Wrap a DataLoader and tag each batch with its source name.
-    
-    The wrapped loader must expose a `last_loader_idx` attribute/property.
+
+    This wrapper is used at any level of a composed data loader tree to
+    attach source names. When stacked, it builds hierarchical source names
+    like ``"group_a/dataset_1"``.
+
+    Args:
+        dataloader: The DataLoader to wrap.
+        source_names: Names for each child loader (by index).
+
+    Notes:
+        - Maps ``last_loader_idx`` to ``source_names``.
+        - If the inner loader already yields ``(tag, batch)``, this wrapper
+          prefixes the resolved parent name: ``f"{parent}/{tag}"``.
     """
 
     def __init__(self, dataloader: ComposableDataLoader, source_names: Sequence[str]):
         self.dataloader = dataloader
         self.source_names = list(source_names)
+        self._last_loader_idx: Optional[Union[int, str]] = None
+
+    @property
+    def last_loader_idx(self) -> Optional[Union[int, str]]:
+        """Forward last_loader_idx from wrapped loader."""
+        return getattr(self.dataloader, "last_loader_idx", self._last_loader_idx)
 
     def _resolve_source_name(self, idx: Optional[Union[int, str]]) -> str:
         if isinstance(idx, str):
             return idx
         if isinstance(idx, int) and 0 <= idx < len(self.source_names):
             return self.source_names[idx]
-        if idx is None:
-            return "unknown"
-        return f"dataset_{idx}"
+        if idx is None and len(self.source_names) == 1:
+            return self.source_names[0]
+        return "unknown" if idx is None else f"dataset_{idx}"
 
     def __iter__(self):
         for batch in self.dataloader:
-            # Pass through if already tagged
-            if isinstance(batch, tuple) and len(batch) == 2 and isinstance(batch[0], (int, str)):
-                yield batch
-                continue
-
             idx = getattr(self.dataloader, "last_loader_idx", None)
-            source_name = self._resolve_source_name(idx)
-            yield source_name, batch
+            self._last_loader_idx = idx
+            parent_name = self._resolve_source_name(idx)
+
+            # Already tagged: (tag, payload). Build hierarchical tag.
+            if isinstance(batch, tuple) and len(batch) == 2 and isinstance(batch[0], (int, str)):
+                tag, payload = batch
+                if parent_name != "unknown" and isinstance(tag, str) and not tag.startswith(f"{parent_name}/"):
+                    tag = f"{parent_name}/{tag}"
+                yield tag, payload
+            else:
+                # Untagged batch: attach parent name directly.
+                yield parent_name, batch
 
     def __len__(self):
         return len(self.dataloader)

@@ -556,6 +556,8 @@ def main(config: _config.TrainConfig):
                     if accum_step < grad_accum_steps - 1:
                         batch = next(data_iter)
                         source, (observation, actions) = _unwrap_batch(batch)
+                        if source is not None:
+                            pbar.write(f"Step {step}: data_source={source} (accumulation step {accum_step + 1}/{grad_accum_steps})")
 
                 # Average the accumulated gradients
                 accumulated_grads = jax.tree.map(

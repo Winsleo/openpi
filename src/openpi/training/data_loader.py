@@ -3,7 +3,7 @@ import logging
 import multiprocessing
 import os
 import typing
-from typing import Literal, Protocol, SupportsIndex, TypeVar
+from typing import Any, Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -675,29 +675,26 @@ class ComposableDataLoaderWrapper:
     
     def __iter__(self):
         for batch in self._composable_loader:
-            # Batch from DataLoaderImpl is already (Observation, actions) tuple
-            if isinstance(batch, tuple) and len(batch) == 2:
-                first, second = batch
-                # Tagged batch: (task_name, (Observation, actions))
-                if isinstance(first, str):
-                    task_name = first
-                    if isinstance(second, tuple) and len(second) == 2:
-                        obs, actions = second
-                    else:
-                        obs, actions = _model.Observation.from_dict(second), second["actions"]
-                    if self._return_source:
-                        yield task_name, (obs, actions)
-                    else:
-                        yield obs, actions
-                # Already processed: (Observation, actions)
-                elif isinstance(first, _model.Observation):
-                    yield first, second
-                # Raw dict batch that was somehow wrapped
-                else:
-                    yield _model.Observation.from_dict(first), second
+            obs, actions, source = self._parse_batch(batch)
+            if self._return_source and source is not None:
+                yield source, (obs, actions)
             else:
-                # Raw dict batch (shouldn't happen with DataLoaderImpl, but handle for safety)
-                yield _model.Observation.from_dict(batch), batch["actions"]
+                yield obs, actions
+
+    def _parse_batch(self, batch) -> tuple[_model.Observation, Any, str | None]:
+        """Parse batch into (Observation, actions, source_tag)."""
+        source = None
+        # Tagged batch: (source_name, payload)
+        if isinstance(batch, tuple) and len(batch) == 2 and isinstance(batch[0], str):
+            source, batch = batch
+        # Tuple batch: (Observation or dict, actions)
+        if isinstance(batch, tuple) and len(batch) == 2:
+            first, actions = batch
+            obs = first if isinstance(first, _model.Observation) else _model.Observation.from_dict(first)
+        else:
+            # Raw dict batch
+            obs, actions = _model.Observation.from_dict(batch), batch["actions"]
+        return obs, actions, source
     
     def __len__(self) -> int:
         return len(self._composable_loader)
@@ -711,8 +708,14 @@ def _build_composable_from_node(
     shuffle: bool,
     skip_norm_stats: bool,
     num_batches: int | None,
+    return_source: bool = False,
+    _is_root: bool = True,
 ) -> tuple[composable.BaseDataLoader, _config.DataConfig]:
-    """Recursively build a composable loader from a config node (dataset or nested composition).
+    """Recursively build a composable loader from a config node.
+
+    Args:
+        return_source: If True, wrap intermediate nodes with SourceTaggedDataLoader
+            to enable hierarchical source names.
     
     Returns:
         (loader, primary_data_config) where primary_data_config is from the first leaf.
@@ -746,6 +749,8 @@ def _build_composable_from_node(
             shuffle=shuffle,
             skip_norm_stats=skip_norm_stats,
             num_batches=None,
+            return_source=return_source,
+            _is_root=False,
         )
         child_loaders.append(sub_loader)
         if primary_data_config is None:
@@ -772,31 +777,15 @@ def _build_composable_from_node(
     elif strategy == "alternating":
         composed = composable.Compose.alternating(*child_loaders, pattern=pattern)
     elif strategy == "tagged":
-        if task_names is None:
-            task_names = [
-                (getattr(c, "repo_id", None) or f"dataset_{i}")
-                if isinstance(c, _config.DataConfigFactory)
-                else f"group_{i}"
-                for i, c in enumerate(inputs)
-            ]
-        loaders_dict = dict(zip(task_names, child_loaders))
+        names = task_names or _unique_source_names(inputs)
+        loaders_dict = dict(zip(names, child_loaders))
         composed = composable.Compose.tagged(loaders_dict, sampling_strategy="random")
     elif strategy == "dynamic":
         composed = composable.Compose.dynamic(*child_loaders, initial_weights=weights)
     elif strategy == "inbatch":
-        batch_size = config.batch_size
-        if weights is not None:
-            w = np.array(weights, dtype=np.float64) / sum(weights)
-            samples_per_loader = (w * batch_size).astype(np.int64)
-            diff = batch_size - int(samples_per_loader.sum())
-            if diff != 0:
-                samples_per_loader[-1] += diff
-            samples_per_loader = samples_per_loader.tolist()
-        else:
-            samples_per_loader = [batch_size // num_loaders] * num_loaders
-            samples_per_loader[-1] += batch_size - sum(samples_per_loader)
+        samples_per_loader = _compute_samples_per_loader(weights, num_loaders, config.batch_size)
         logging.info(
-            f"inbatch: num_loaders={num_loaders}, batch_size={batch_size}, "
+            f"inbatch: num_loaders={num_loaders}, batch_size={config.batch_size}, "
             f"samples_per_loader={samples_per_loader}"
         )
         composed = composable.Compose.inbatch(
@@ -807,19 +796,65 @@ def _build_composable_from_node(
     else:
         raise ValueError(f"Unknown composition strategy: {strategy}")
 
+    # Wrap intermediate nodes with SourceTaggedDataLoader only when return_source
+    # is enabled. Root wrapping is handled by create_composable_data_loader.
+    if return_source and not _is_root:
+        source_names = _unique_source_names(inputs)
+        composed = composable.SourceTaggedDataLoader(composed, source_names)
+
     assert primary_data_config is not None
     return composed, primary_data_config
 
 
-def _default_source_names(inputs: Sequence[_config.ComposableNode]) -> list[str]:
-    """Derive default source names from child nodes."""
-    names = []
-    for i, node in enumerate(inputs):
-        if isinstance(node, _config.DataConfigFactory):
-            names.append(getattr(node, "repo_id", None) or f"dataset_{i}")
+def _unique_source_names(inputs: Sequence[_config.ComposableNode]) -> list[str]:
+    """Generate unique source names for child nodes, adding suffixes for duplicates.
+
+    For DataConfigFactory leaves, uses repo_id if available.
+    For ComposableDataConfig nodes, uses 'group_<index>'.
+    Duplicates at the same level get '_0', '_1', etc. suffixes.
+    """
+    from collections import Counter
+
+    # Collect base names
+    base_names = [
+        getattr(node, "repo_id", None) or f"dataset_{i}"
+        if isinstance(node, _config.DataConfigFactory)
+        else f"group_{i}"
+        for i, node in enumerate(inputs)
+    ]
+
+    # Add suffixes for duplicates
+    counts = Counter(base_names)
+    seen: dict[str, int] = {}
+    result = []
+    for name in base_names:
+        if counts[name] > 1:
+            idx = seen.setdefault(name, 0)
+            seen[name] += 1
+            result.append(f"{name}_{idx}")
         else:
-            names.append(f"group_{i}")
-    return names
+            result.append(name)
+    return result
+
+
+def _compute_samples_per_loader(
+    weights: Sequence[float] | None,
+    num_loaders: int,
+    batch_size: int,
+) -> list[int]:
+    """Compute per-loader sample counts for inbatch mixing."""
+    if weights is not None:
+        w = np.array(weights, dtype=np.float64)
+        w /= w.sum()
+        samples = (w * batch_size).astype(np.int64)
+        # Distribute remainder to last loader
+        samples[-1] += batch_size - int(samples.sum())
+        return samples.tolist()
+    # Equal split with remainder to last
+    base = batch_size // num_loaders
+    samples = [base] * num_loaders
+    samples[-1] += batch_size - sum(samples)
+    return samples
 
 
 def create_composable_data_loader(
@@ -875,21 +910,20 @@ def create_composable_data_loader(
         shuffle=shuffle,
         skip_norm_stats=skip_norm_stats,
         num_batches=num_batches,
+        return_source=return_source,
     )
 
-    inputs = composable_config.children
     strategy = composable_config.composition_strategy
-    task_names = composable_config.task_names
+    children = composable_config.children
 
+    # Wrap root with SourceTaggedDataLoader if return_source is enabled
     if return_source and strategy != "tagged":
-        if task_names is None:
-            task_names = _default_source_names(inputs)
-        composed = composable.SourceTaggedDataLoader(composed, task_names)
+        source_names = composable_config.task_names or _unique_source_names(children)
+        composed = composable.SourceTaggedDataLoader(composed, source_names)
 
-    logging.info(f"Created composable data loader (strategy at root: '{strategy}')")
-    logging.info(f"  - Root inputs: {len(inputs)}")
-    if composable_config.weights is not None:
-        logging.info(f"  - Weights: {composable_config.weights}")
+    # Log summary
+    weights_info = f", weights={list(composable_config.weights)}" if composable_config.weights else ""
+    logging.info(f"Created composable data loader: strategy='{strategy}', children={len(children)}{weights_info}")
 
     return ComposableDataLoaderWrapper(composed, primary_data_config, return_source=return_source)
 
