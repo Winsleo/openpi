@@ -7,7 +7,7 @@ import difflib
 import logging
 import os
 import pathlib
-from typing import Any, Literal, Protocol, TypeAlias, List
+from typing import Any, Literal, Protocol, TypeAlias, List, Union
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -473,38 +473,58 @@ class RLDSDroidDataConfig(DataConfigFactory):
         )
 
 
+# Recursive node: either a dataset (leaf) or another ComposableDataConfig (nested).
+ComposableNode = Union[DataConfigFactory, "ComposableDataConfig"]
+
+
 @dataclasses.dataclass(frozen=True)
 class ComposableDataConfig:
     """Configuration for composable/mixed dataset training.
-    
-    This config allows combining multiple datasets with various mixing strategies
-    for multi-task or multi-domain training.
-    
-    Supported strategies:
-        - "random": Sample from loaders with optional weights
-        - "proportional": Fixed ratio allocation of batches (ratios=weights)
-        - "round_robin": Cycle through loaders sequentially
-        - "alternating": Custom pattern-based alternation
-        - "tagged": Add source labels to batches
-        - "dynamic": Adjust weights based on training feedback
-        - "inbatch": Mix samples within a single batch (samples_per_loader=weights*batch_size)
+
+    Uses ``children`` to describe a composition tree (supports nesting). Each
+    node specifies a ``composition_strategy`` and its parameters. Children can
+    be either dataset leaves (``DataConfigFactory``) or further
+    ``ComposableDataConfig`` nodes.
+
+    Supported strategies (per node):
+        - "random": weighted random sampling
+        - "proportional": fixed batch ratio allocation (ratios = weights)
+        - "round_robin": round‑robin over children
+        - "alternating": custom index pattern
+        - "tagged": task/source tagging
+        - "dynamic": dynamically adjusted weights
+        - "inbatch": mix samples within a single batch
+
+    Nested example:
+        ComposableDataConfig(
+            composition_strategy="proportional",
+            children=[
+                ComposableDataConfig(
+                    composition_strategy="random",
+                    children=[dataset_a, dataset_b],
+                    weights=[0.6, 0.4],
+                ),
+                dataset_c,
+            ],
+            weights=[2, 1],
+        )
     """
-    # List of data config factories for each dataset
-    dataset_configs: Sequence[DataConfigFactory] = ()
+    # Nested composition: child nodes (datasets or further compositions)
+    children: Sequence[ComposableNode] = ()
     
-    # Composition strategy
+    # Composition strategy for this node
     composition_strategy: str = "random"
     
     # Weights: for random/proportional use as-is; for inbatch, samples_per_loader = weights * batch_size (normalized)
     weights: Sequence[float] | None = None
     
-    # Pattern for alternating strategy (indices into dataset_configs)
+    # Pattern for alternating strategy (indices into this node's children)
     pattern: Sequence[int] | None = None
     
-    # Task names for tagged strategy (must match number of datasets)
+    # Task names for tagged strategy (must match number of children at this node)
     task_names: Sequence[str] | None = None
 
-    # Whether to tag each batch with its source loader name
+    # Whether to tag each batch with its source loader name (typically only at root)
     return_source: bool = False
     
     # Whether to randomly sample from each batch (for inbatch strategy)
@@ -513,7 +533,6 @@ class ComposableDataConfig:
     
     # Random seed for reproducibility
     seed: int | None = None
-
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotDROIDDataConfig(DataConfigFactory):
@@ -804,21 +823,48 @@ _CONFIGS = [
         checkpoint_base_dir="./outputs/checkpoints",
         num_workers=min(32, os.cpu_count() - 2),
     ),
-    
-    # Mixed dataset training example for B1K
-    # This config demonstrates how to train on multiple datasets simultaneously
-    # using the composable data loader with weighted random mixing.
-    # Note: When composable_data is set, the 'data' field is not used (defaults to FakeDataConfig).
+
+    # Nested composable example: proportional( random(A, B), C ) with ratio 2:1
+    # Root uses 'children' to define a tree; inner node mixes two subsets randomly, outer splits 2:1.
     TrainConfig(
-        name="pi05_b1k_mixed",
-        exp_name="openpi_mixed",
+        name="pi05_b1k_nested",
+        exp_name="openpi_nested",
         project_name="B1K",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=50, paligemma_variant="gemma_2b"),
-        # Composable data configuration for mixed training
-        # (no need to specify 'data' - it's ignored when composable_data is set)
         composable_data=ComposableDataConfig(
-            dataset_configs=[
-                # Dataset 1: First subset of B1K demos
+            composition_strategy="proportional",
+            weights=[2, 1],
+            children=[
+                ComposableDataConfig(
+                    composition_strategy="random",
+                    weights=[0.6, 0.4],
+                    children=[
+                        LeRobotB1KDataConfig(
+                            repo_id="behavior-1k/2025-challenge-demos",
+                            assets=AssetsConfig(
+                                assets_dir="/model/pi05_base/assets",
+                                asset_id="behavior-1k/2025-challenge-demos",
+                            ),
+                            base_config=DataConfig(
+                                prompt_from_task=True,
+                                episodes_index=list(range(100)),
+                                behavior_dataset_root="/data/behavior-1k-dataset",
+                            ),
+                        ),
+                        LeRobotB1KDataConfig(
+                            repo_id="behavior-1k/2025-challenge-demos",
+                            assets=AssetsConfig(
+                                assets_dir="/model/pi05_base/assets",
+                                asset_id="behavior-1k/2025-challenge-demos",
+                            ),
+                            base_config=DataConfig(
+                                prompt_from_task=True,
+                                episodes_index=list(range(100, 190)),
+                                behavior_dataset_root="/data/behavior-1k-dataset",
+                            ),
+                        ),
+                    ],
+                ),
                 LeRobotB1KDataConfig(
                     repo_id="behavior-1k/2025-challenge-demos",
                     assets=AssetsConfig(
@@ -827,46 +873,27 @@ _CONFIGS = [
                     ),
                     base_config=DataConfig(
                         prompt_from_task=True,
-                        episodes_index=list(range(100)),  # Episodes 0-99
+                        episodes_index=list(range(50)),  # Another subset
                         behavior_dataset_root="/data/behavior-1k-dataset",
                     ),
                 ),
-                # Dataset 2: Second subset of B1K demos
-                LeRobotB1KDataConfig(
-                    repo_id="behavior-1k/2025-challenge-demos",
-                    assets=AssetsConfig(
-                        assets_dir="/model/pi05_base/assets",
-                        asset_id="behavior-1k/2025-challenge-demos",
-                    ),
-                    base_config=DataConfig(
-                        prompt_from_task=True,
-                        episodes_index=list(range(100, 190)),  # Episodes 100-189
-                        behavior_dataset_root="/data/behavior-1k-dataset",
-                    ),
-                ),
-                # You can add more datasets here, for example:
-                # Dataset 3: Another LeRobot dataset
-                # LeRobotAlohaDataConfig(repo_id="other/dataset", ...),
             ],
-            composition_strategy="inbatch",  # Options: "random", "proportional", "round_robin", "tagged", "dynamic", "inbatch"
-            weights=[0.6, 0.4],  # 60% from dataset 1, 40% from dataset 2
             return_source=True,
             seed=42,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/model/pi05_base/params"),
         num_train_steps=50000,
         freeze_filter=pi0_config.Pi0Config(
-            pi05=True, action_horizon=50, paligemma_variant="gemma"
+            pi05=True, action_horizon=50, paligemma_variant="gemma_2b", freeze_components=["llm_base"]
         ).get_freeze_filter(),
         ema_decay=None,
-        val_log_interval=5000,
+        val_log_interval=0,
         val_repo_id="behavior-1k/2025-challenge-demos",
         val_episodes_index=list(range(190, 200)),
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir="./outputs/checkpoints",
         num_workers=min(32, os.cpu_count() - 2),
     ),
-    
     #
     # Fine-tuning Libero configs.
     #
