@@ -477,6 +477,11 @@ class RLDSDroidDataConfig(DataConfigFactory):
 ComposableNode = Union[DataConfigFactory, "ComposableDataConfig"]
 
 
+_VALID_STRATEGIES = frozenset({
+    "random", "proportional", "round_robin", "alternating", "tagged", "dynamic", "inbatch"
+})
+
+
 @dataclasses.dataclass(frozen=True)
 class ComposableDataConfig:
     """Configuration for composable/mixed dataset training.
@@ -489,7 +494,7 @@ class ComposableDataConfig:
     Supported strategies (per node):
         - "random": weighted random sampling
         - "proportional": fixed batch ratio allocation (ratios = weights)
-        - "round_robin": round‑robin over children
+        - "round_robin": round-robin over children
         - "alternating": custom index pattern
         - "tagged": task/source tagging
         - "dynamic": dynamically adjusted weights
@@ -509,22 +514,22 @@ class ComposableDataConfig:
             weights=[2, 1],
         )
     """
-    # Nested composition: child nodes (datasets or further compositions)
+    # Child nodes (datasets or nested compositions)
     children: Sequence[ComposableNode] = ()
-    
-    # Composition strategy for this node
+
+    # Composition strategy
     composition_strategy: str = "random"
     
     # Weights: for random/proportional use as-is; for inbatch, samples_per_loader = weights * batch_size (normalized)
     weights: Sequence[float] | None = None
-    
-    # Pattern for alternating strategy (indices into this node's children)
+
+    # Pattern indices for alternating strategy
     pattern: Sequence[int] | None = None
-    
-    # Task names for tagged strategy (must match number of children at this node)
+
+    # Task names for tagged strategy
     task_names: Sequence[str] | None = None
 
-    # Whether to tag each batch with its source loader name (typically only at root)
+    # Tag each batch with its source (typically at root only)
     return_source: bool = False
     
     # Whether to randomly sample from each batch (for inbatch strategy)
@@ -533,6 +538,21 @@ class ComposableDataConfig:
     
     # Random seed for reproducibility
     seed: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.composition_strategy not in _VALID_STRATEGIES:
+            raise ValueError(
+                f"Unknown composition_strategy '{self.composition_strategy}'. "
+                f"Valid options: {sorted(_VALID_STRATEGIES)}"
+            )
+        if self.weights is not None and len(self.weights) != len(self.children):
+            raise ValueError(
+                f"weights length ({len(self.weights)}) must match children length ({len(self.children)})"
+            )
+        if self.task_names is not None and len(self.task_names) != len(self.children):
+            raise ValueError(
+                f"task_names length ({len(self.task_names)}) must match children length ({len(self.children)})"
+            )
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotDROIDDataConfig(DataConfigFactory):
