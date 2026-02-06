@@ -132,6 +132,15 @@ class BaseDataLoader(Protocol[T_co]):
         ...
 
 
+# Type alias for any valid DataLoader
+# Using BaseDataLoader Protocol ensures compatibility with:
+# - torch.utils.data.DataLoader
+# - OpenPI's TorchDataLoader, RLDSDataLoader, DataLoaderImpl
+# - All ComposableDataLoader subclasses
+# - Any object implementing __iter__
+AnyDataLoader = BaseDataLoader
+
+
 # =============================================================================
 # Abstract Base Class
 # =============================================================================
@@ -147,7 +156,11 @@ class ComposableDataLoader(ABC, BaseDataLoader):
     - Supports arbitrary nesting of composable loaders
     - Compatible with PyTorch DataLoader
     - Framework-agnostic design
-    
+    - ``dataloaders``: child loader storage
+    - ``last_loader_idx``: tracks which child produced the last batch
+    - Default ``__len__`` (sum of child lengths, override if needed)
+    - ``_create_iterators`` / ``_normalize_weights`` helpers
+
     Inheritance hierarchy:
         BaseDataLoader (Protocol)
             ↑
@@ -161,37 +174,73 @@ class ComposableDataLoader(ABC, BaseDataLoader):
         >>> for batch in mixed:
         ...     process(batch)
     """
-    
+
+    def __init__(self, dataloaders: Sequence[AnyDataLoader]):
+        self.dataloaders = list(dataloaders)
+        self._num_loaders = len(self.dataloaders)
+        self._last_loader_idx: Optional[Union[int, str]] = None
+
+    @property
+    def last_loader_idx(self) -> Optional[Union[int, str]]:
+        """Index (or label) of the loader that produced the last batch."""
+        return self._last_loader_idx
+
+    # ------------------------------------------------------------------
+    # Helpers available to all subclasses
+    # ------------------------------------------------------------------
+
+    def _create_iterators(self) -> list:
+        """Create fresh iterators from all child loaders."""
+        return [iter(ld) for ld in self.dataloaders]
+
+    @staticmethod
+    def _normalize_weights(weights: Sequence[float]) -> np.ndarray:
+        """Normalize weights to a probability distribution."""
+        w = np.asarray(weights, dtype=np.float64)
+        return w / w.sum()
+
+    @staticmethod
+    def _weighted_choice(
+        num_loaders: int,
+        base_weights: np.ndarray,
+        active: np.ndarray,
+        buf: np.ndarray,
+    ) -> int:
+        """Pick a loader index via weighted random choice over active loaders.
+
+        Args:
+            num_loaders: Total number of loaders.
+            base_weights: Base weight array (not mutated).
+            active: Boolean mask of active loaders.
+            buf: Pre-allocated float64 buffer (len == num_loaders).
+
+        Returns:
+            Selected loader index, or -1 if no active loaders.
+        """
+        np.multiply(base_weights, active, out=buf)
+        total = buf.sum()
+        if total == 0:
+            return -1
+        buf /= total
+        return int(_rng.choice(num_loaders, p=buf))
+
+    # ------------------------------------------------------------------
+    # Default implementations (override in subclasses if needed)
+    # ------------------------------------------------------------------
+
     @abstractmethod
     def __iter__(self) -> Iterator:
         """Return an iterator over batches."""
         ...
-    
-    @abstractmethod
+
     def __len__(self) -> int:
-        """Return the total number of batches."""
-        ...
-    
+        """Default: sum of all child loader lengths."""
+        return sum(len(ld) for ld in self.dataloaders)
+
     @staticmethod
     def is_dataloader(obj) -> bool:
-        """Check if an object satisfies the BaseDataLoader protocol.
-        
-        Args:
-            obj: Object to check.
-            
-        Returns:
-            True if obj implements __iter__, False otherwise.
-        """
+        """Check if an object satisfies the BaseDataLoader protocol."""
         return isinstance(obj, BaseDataLoader)
-
-
-# Type alias for any valid DataLoader
-# Using BaseDataLoader Protocol ensures compatibility with:
-# - torch.utils.data.DataLoader
-# - OpenPI's TorchDataLoader, RLDSDataLoader, DataLoaderImpl
-# - All ComposableDataLoader subclasses
-# - Any object implementing __iter__
-AnyDataLoader = BaseDataLoader
 
 
 # =============================================================================
@@ -211,41 +260,28 @@ class RoundRobinDataLoader(ComposableDataLoader):
         >>> loader = RoundRobinDataLoader([loader_a, loader_b, loader_c])
         >>> # Yields: batch_a, batch_b, batch_c, batch_a, batch_b, ...
     """
-    
-    def __init__(self, dataloaders: Sequence[AnyDataLoader]):
-        self.dataloaders = list(dataloaders)
-        self.num_loaders = len(dataloaders)
-        self._last_loader_idx: Optional[int] = None
 
-    @property
-    def last_loader_idx(self) -> Optional[int]:
-        """Get the index of the loader that produced the last batch."""
-        return self._last_loader_idx
-    
+    def __init__(self, dataloaders: Sequence[AnyDataLoader]):
+        super().__init__(dataloaders)
+
     def __iter__(self):
-        iterators = [iter(loader) for loader in self.dataloaders]
+        iterators = self._create_iterators()
         # Use boolean mask instead of removing elements (preserves original indices)
-        active = [True] * self.num_loaders
-        active_count = self.num_loaders
-        loader_idx = 0
-        
+        active = [True] * self._num_loaders
+        active_count = self._num_loaders
+        idx = 0
+
         while active_count > 0:
             # Skip inactive loaders
-            while not active[loader_idx]:
-                loader_idx = (loader_idx + 1) % self.num_loaders
-            
+            while not active[idx]:
+                idx = (idx + 1) % self._num_loaders
             try:
-                batch = next(iterators[loader_idx])
-                self._last_loader_idx = loader_idx  # Now correctly tracks original index
-                yield batch
+                self._last_loader_idx = idx
+                yield next(iterators[idx])
             except StopIteration:
-                active[loader_idx] = False
+                active[idx] = False
                 active_count -= 1
-            
-            loader_idx = (loader_idx + 1) % self.num_loaders
-    
-    def __len__(self):
-        return sum(len(loader) for loader in self.dataloaders)
+            idx = (idx + 1) % self._num_loaders
 
 
 # =============================================================================
@@ -269,51 +305,31 @@ class RandomMixDataLoader(ComposableDataLoader):
         ...     weights=[0.7, 0.3]
         ... )
     """
-    
-    def __init__(
-        self, 
-        dataloaders: Sequence[AnyDataLoader], 
-        weights: Optional[Sequence[float]] = None
-    ):
-        self.dataloaders = list(dataloaders)
-        self._last_loader_idx: Optional[int] = None
-        self._num_loaders = len(dataloaders)
-        
-        if weights is None:
-            weights = [1.0] * self._num_loaders
-        total = sum(weights)
-        self.weights = np.array([w / total for w in weights], dtype=np.float64)
 
-    @property
-    def last_loader_idx(self) -> Optional[int]:
-        """Get the index of the loader that produced the last batch."""
-        return self._last_loader_idx
-    
+    def __init__(
+        self,
+        dataloaders: Sequence[AnyDataLoader],
+        weights: Optional[Sequence[float]] = None,
+    ):
+        super().__init__(dataloaders)
+        self.weights = self._normalize_weights(
+            weights if weights is not None else [1.0] * self._num_loaders
+        )
+
     def __iter__(self):
-        iterators = [iter(loader) for loader in self.dataloaders]
-        # Use boolean mask + pre-allocated array for efficiency
+        iterators = self._create_iterators()
         active = np.ones(self._num_loaders, dtype=bool)
-        current_weights = self.weights.copy()  # Reusable buffer
-        
+        buf = np.empty(self._num_loaders, dtype=np.float64)
+
         while active.any():
-            # Compute probs in-place (avoid allocation)
-            np.multiply(self.weights, active, out=current_weights)
-            weight_sum = current_weights.sum()
-            if weight_sum == 0:
+            idx = self._weighted_choice(self._num_loaders, self.weights, active, buf)
+            if idx < 0:
                 break
-            current_weights /= weight_sum
-            
-            idx = int(_rng.choice(self._num_loaders, p=current_weights))
-            
             try:
-                batch = next(iterators[idx])
                 self._last_loader_idx = idx
-                yield batch
+                yield next(iterators[idx])
             except StopIteration:
                 active[idx] = False
-    
-    def __len__(self):
-        return sum(len(loader) for loader in self.dataloaders)
 
 
 # =============================================================================
@@ -342,63 +358,45 @@ class ProportionalMixDataLoader(ComposableDataLoader):
         ...     max_batches=100
         ... )
     """
-    
+
     def __init__(
-        self, 
-        dataloaders: Sequence[AnyDataLoader], 
+        self,
+        dataloaders: Sequence[AnyDataLoader],
         ratios: Optional[Sequence[float]] = None,
-        max_batches: Optional[int] = None
+        max_batches: Optional[int] = None,
     ):
-        self.dataloaders = list(dataloaders)
-        self._last_loader_idx: Optional[int] = None
-        
-        if ratios is None:
-            ratios = [1.0] * len(dataloaders)
-        
-        total_batches = max_batches or sum(len(loader) for loader in dataloaders)
-        ratios_arr = np.array(ratios) / sum(ratios)
+        super().__init__(dataloaders)
+        ratios_arr = self._normalize_weights(
+            ratios if ratios is not None else [1.0] * self._num_loaders
+        )
+        total_batches = max_batches or sum(len(ld) for ld in self.dataloaders)
         self.batches_per_loader = (ratios_arr * total_batches).astype(int)
-        
         # Distribute remainder to last loader
-        diff = total_batches - self.batches_per_loader.sum()
-        if diff > 0:
-            self.batches_per_loader[-1] += diff
-        
+        self.batches_per_loader[-1] += total_batches - int(self.batches_per_loader.sum())
         self._total_batches = int(self.batches_per_loader.sum())
 
-    @property
-    def last_loader_idx(self) -> Optional[int]:
-        """Get the index of the loader that produced the last batch."""
-        return self._last_loader_idx
-    
     def __iter__(self):
-        iterators = [iter(loader) for loader in self.dataloaders]
-        num_loaders = len(self.dataloaders)
-        
-        # Use counters instead of pre-generating full schedule (memory efficient)
-        remaining = self.batches_per_loader.astype(np.float64)  # Use float for in-place ops
-        probs = np.empty(num_loaders, dtype=np.float64)  # Reusable buffer
-        
+        iterators = self._create_iterators()
+        remaining = self.batches_per_loader.astype(np.float64)
+        buf = np.empty(self._num_loaders, dtype=np.float64)
+
         for _ in range(self._total_batches):
-            # Compute probs in-place (avoid allocation)
             total = remaining.sum()
             if total <= 0:
                 break
-            np.divide(remaining, total, out=probs)
-            
-            loader_idx = int(_rng.choice(num_loaders, p=probs))
-            remaining[loader_idx] -= 1
-            
+            np.divide(remaining, total, out=buf)
+            idx = int(_rng.choice(self._num_loaders, p=buf))
+            remaining[idx] -= 1
+
             try:
-                batch = next(iterators[loader_idx])
+                batch = next(iterators[idx])
             except StopIteration:
-                # Restart exhausted loader
-                iterators[loader_idx] = iter(self.dataloaders[loader_idx])
-                batch = next(iterators[loader_idx])
-            
-            self._last_loader_idx = loader_idx
+                iterators[idx] = iter(self.dataloaders[idx])
+                batch = next(iterators[idx])
+
+            self._last_loader_idx = idx
             yield batch
-    
+
     def __len__(self):
         return self._total_batches
 
@@ -421,40 +419,29 @@ class AlternatingDataLoader(ComposableDataLoader):
         ...     pattern=[0, 0, 1]
         ... )
     """
-    
-    def __init__(
-        self, 
-        dataloaders: Sequence[AnyDataLoader], 
-        pattern: Optional[Sequence[int]] = None
-    ):
-        self.dataloaders = list(dataloaders)
-        self.pattern = list(pattern) if pattern else list(range(len(dataloaders)))
-        self._last_loader_idx: Optional[int] = None
 
-    @property
-    def last_loader_idx(self) -> Optional[int]:
-        """Get the index of the loader that produced the last batch."""
-        return self._last_loader_idx
-    
+    def __init__(
+        self,
+        dataloaders: Sequence[AnyDataLoader],
+        pattern: Optional[Sequence[int]] = None,
+    ):
+        super().__init__(dataloaders)
+        self.pattern = list(pattern) if pattern else list(range(self._num_loaders))
+
     def __iter__(self):
-        iterators = [iter(loader) for loader in self.dataloaders]
+        iterators = self._create_iterators()
         pattern_cycle = itertools.cycle(self.pattern)
-        
-        total_batches = sum(len(loader) for loader in self.dataloaders)
-        batches_yielded = 0
-        
-        while batches_yielded < total_batches:
-            loader_idx = next(pattern_cycle)
+        total = len(self)
+        yielded = 0
+
+        while yielded < total:
+            idx = next(pattern_cycle)
             try:
-                batch = next(iterators[loader_idx])
-                self._last_loader_idx = loader_idx
-                yield batch
-                batches_yielded += 1
+                self._last_loader_idx = idx
+                yield next(iterators[idx])
+                yielded += 1
             except StopIteration:
                 continue
-    
-    def __len__(self):
-        return sum(len(loader) for loader in self.dataloaders)
 
 
 # =============================================================================
@@ -481,76 +468,52 @@ class TaskTaggedDataLoader(ComposableDataLoader):
         >>> for task_name, batch in loader:
         ...     print(f"Batch from {task_name}")
     """
-    
+
     def __init__(
-        self, 
-        dataloaders: Dict[str, AnyDataLoader], 
+        self,
+        dataloaders: Dict[str, AnyDataLoader],
         sampling_strategy: str = 'random',
-        propagate_tags: bool = False
+        propagate_tags: bool = False,
     ):
-        self.dataloaders = dataloaders
+        # TaskTaggedDataLoader uses a dict; store list of values for base class
+        super().__init__(list(dataloaders.values()))
+        self._dataloaders_dict = dataloaders
         self.task_names = list(dataloaders.keys())
-        # O(1) lookup for task -> index
         self._task_to_idx = {name: i for i, name in enumerate(self.task_names)}
         self.sampling_strategy = sampling_strategy
         self.propagate_tags = propagate_tags
-        self._last_loader_idx: Optional[int] = None
 
-    @property
-    def last_loader_idx(self) -> Optional[int]:
-        """Get the index of the loader that produced the last batch."""
-        return self._last_loader_idx
-    
     def __iter__(self):
-        iterators = {name: iter(loader) for name, loader in self.dataloaders.items()}
-        
-        if self.sampling_strategy == 'round_robin':
-            task_cycle = itertools.cycle(self.task_names)
-        
-        # Use list for O(1) random access, track active via boolean
-        num_tasks = len(self.task_names)
-        active = [True] * num_tasks
-        active_count = num_tasks
-        # Cache for random sampling (avoid repeated list creation)
+        iterators = {name: iter(ld) for name, ld in self._dataloaders_dict.items()}
+        task_cycle = itertools.cycle(self.task_names) if self.sampling_strategy == 'round_robin' else None
+
+        active = [True] * self._num_loaders
+        active_count = self._num_loaders
         active_list = self.task_names.copy()
-        
+
         while active_count > 0:
             if self.sampling_strategy == 'random':
-                # Use cached list, only rebuild when needed
                 task = str(_rng.choice(active_list))
-            elif self.sampling_strategy == 'round_robin':
+            elif task_cycle is not None:
                 task = next(task_cycle)
-                task_idx = self._task_to_idx[task]
-                while not active[task_idx]:
+                while not active[self._task_to_idx[task]]:
                     task = next(task_cycle)
-                    task_idx = self._task_to_idx[task]
             else:
                 raise ValueError(f"Unknown sampling strategy: {self.sampling_strategy}")
-            
+
             task_idx = self._task_to_idx[task]
-            
             try:
                 batch = next(iterators[task])
-                self._last_loader_idx = task_idx  # O(1) lookup
-                
-                # Handle nested tagged batches
-                if self.propagate_tags and isinstance(batch, tuple) and len(batch) == 2:
-                    if isinstance(batch[0], str):
-                        nested_task, nested_batch = batch
-                        yield f"{task}/{nested_task}", nested_batch
-                    else:
-                        yield task, batch
+                self._last_loader_idx = task_idx
+
+                if self.propagate_tags and isinstance(batch, tuple) and len(batch) == 2 and isinstance(batch[0], str):
+                    yield f"{task}/{batch[0]}", batch[1]
                 else:
                     yield task, batch
-                    
             except StopIteration:
                 active[task_idx] = False
                 active_count -= 1
-                # Rebuild active_list only when a task is exhausted
-                active_list = [self.task_names[i] for i in range(num_tasks) if active[i]]
-    
-    def __len__(self):
-        return sum(len(loader) for loader in self.dataloaders.values())
+                active_list = [self.task_names[i] for i in range(self._num_loaders) if active[i]]
 
 
 # =============================================================================
@@ -575,9 +538,10 @@ class SourceTaggedDataLoader(ComposableDataLoader):
     """
 
     def __init__(self, dataloader: ComposableDataLoader, source_names: Sequence[str]):
+        # SourceTaggedDataLoader wraps a single loader, not a list
+        super().__init__([dataloader])
         self.dataloader = dataloader
         self.source_names = list(source_names)
-        self._last_loader_idx: Optional[Union[int, str]] = None
 
     @property
     def last_loader_idx(self) -> Optional[Union[int, str]]:
@@ -599,7 +563,7 @@ class SourceTaggedDataLoader(ComposableDataLoader):
             self._last_loader_idx = idx
             parent_name = self._resolve_source_name(idx)
 
-            # Already tagged: (tag, payload). Build hierarchical tag.
+            # Already tagged: (tag, payload) -> prefix with parent name
             if isinstance(batch, tuple) and len(batch) == 2 and isinstance(batch[0], (int, str)):
                 tag, payload = batch
                 if parent_name != "unknown" and isinstance(tag, str) and not tag.startswith(f"{parent_name}/"):
@@ -642,38 +606,26 @@ class DynamicScheduleDataLoader(ComposableDataLoader):
         ...     loss = train_step(batch)
         ...     loader.update_weights(loader.last_loader_idx, loss)
     """
-    
+
     def __init__(
-        self, 
-        dataloaders: Sequence[AnyDataLoader], 
+        self,
+        dataloaders: Sequence[AnyDataLoader],
         initial_weights: Optional[Sequence[float]] = None,
-        enable_tracking: bool = True
+        enable_tracking: bool = True,
     ):
-        self.dataloaders = list(dataloaders)
-        
-        if initial_weights is None:
-            initial_weights = [1.0] * len(dataloaders)
-        self.weights = np.array(initial_weights) / sum(initial_weights)
-        
+        super().__init__(dataloaders)
+        self.weights = self._normalize_weights(
+            initial_weights if initial_weights is not None else [1.0] * self._num_loaders
+        )
         self.enable_tracking = enable_tracking
         self.loader_performance: Dict[int, list] = defaultdict(list)
-        self.batches_from_loader = [0] * len(dataloaders)
-        self._last_loader_idx: Optional[int] = None
-    
-    @property
-    def last_loader_idx(self) -> Optional[int]:
-        """Get the index of the loader that produced the last batch.
-        
-        Returns:
-            Loader index, or None if iteration hasn't started.
-        """
-        return self._last_loader_idx
-    
+        self.batches_from_loader = [0] * self._num_loaders
+
     def update_weights(
         self, 
         loader_idx: int, 
         performance: float, 
-        learning_rate: float = 0.1
+        learning_rate: float = 0.1,
     ):
         """Update sampling weights based on performance feedback.
         
@@ -687,53 +639,35 @@ class DynamicScheduleDataLoader(ComposableDataLoader):
         """
         if not self.enable_tracking:
             return
-            
         self.loader_performance[loader_idx].append(performance)
-        
+
         avg_perfs = np.array([
-            np.mean(self.loader_performance.get(i, [0.5])) 
-            for i in range(len(self.dataloaders))
+            np.mean(self.loader_performance.get(i, [0.5]))
+            for i in range(self._num_loaders)
         ])
-        
         if avg_perfs.max() > avg_perfs.min():
             normalized = (avg_perfs - avg_perfs.min()) / (avg_perfs.max() - avg_perfs.min())
-            # Lower performance (loss) = higher weight
-            target_weights = 1 - normalized
-            target_weights = target_weights / target_weights.sum()
-            
-            self.weights = (1 - learning_rate) * self.weights + learning_rate * target_weights
-    
+            target = (1 - normalized)
+            target /= target.sum()
+            self.weights = (1 - learning_rate) * self.weights + learning_rate * target
+
     def __iter__(self):
-        iterators = [iter(loader) for loader in self.dataloaders]
-        num_loaders = len(self.dataloaders)
-        self._last_loader_idx = None
-        
-        # Use boolean mask for O(1) deactivation
-        active = np.ones(num_loaders, dtype=bool)
-        current_weights = np.empty(num_loaders, dtype=np.float64)  # Reusable buffer
-        
+        iterators = self._create_iterators()
+        active = np.ones(self._num_loaders, dtype=bool)
+        buf = np.empty(self._num_loaders, dtype=np.float64)
+
         while active.any():
-            # Compute probs in-place
-            np.multiply(self.weights, active, out=current_weights)
-            weight_sum = current_weights.sum()
-            if weight_sum == 0:
+            idx = self._weighted_choice(self._num_loaders, self.weights, active, buf)
+            if idx < 0:
                 break
-            current_weights /= weight_sum
-            
-            idx = int(_rng.choice(num_loaders, p=current_weights))
-            
             try:
-                batch = next(iterators[idx])
                 self._last_loader_idx = idx
+                yield next(iterators[idx])
                 if self.enable_tracking:
                     self.batches_from_loader[idx] += 1
-                yield batch
             except StopIteration:
                 active[idx] = False
-    
-    def __len__(self):
-        return sum(len(loader) for loader in self.dataloaders)
-    
+
     def get_statistics(self) -> dict:
         """Get usage statistics.
         
@@ -744,7 +678,7 @@ class DynamicScheduleDataLoader(ComposableDataLoader):
         return {
             'batches_per_loader': self.batches_from_loader,
             'current_weights': self.weights.tolist(),
-            'performance_history': dict(self.loader_performance)
+            'performance_history': dict(self.loader_performance),
         }
 
 
@@ -761,7 +695,6 @@ def _get_batch_size(data) -> int:
     raise TypeError(f"Cannot determine batch size for type {type(data)}")
 
 
-from openpi.training.pytree_utils import contains_jax_array
 class InBatchMixDataLoader(ComposableDataLoader):
     """Mix samples from multiple DataLoaders within a single batch.
     
@@ -784,106 +717,92 @@ class InBatchMixDataLoader(ComposableDataLoader):
         ...     samples_per_loader=[16, 16]
         ... )
     """
-    
+
     def __init__(
-        self, 
-        dataloaders: Sequence[AnyDataLoader], 
+        self,
+        dataloaders: Sequence[AnyDataLoader],
         samples_per_loader: Optional[Sequence[int]] = None,
         total_batch_size: Optional[int] = None,
-        random_sample: bool = False
+        random_sample: bool = False,
     ):
-        self.dataloaders = list(dataloaders)
-        self._num_loaders = len(dataloaders)
-        self._last_loader_idx: Optional[Union[int, str]] = None
+        super().__init__(dataloaders)
         self._random_sample = random_sample
-        # Prefer sharding from a loader that has _sharding (unified across mixed batch)
         self._sharding = next(
             (getattr(ld, "sharding", None) for ld in self.dataloaders if getattr(ld, "sharding", None) is not None),
             None,
         )
-        
+        # Lazy-load apply_sharding only when sharding is actually used
+        self._apply_sharding = None
+        if self._sharding is not None:
+            from openpi.training.pytree_utils import apply_sharding
+            self._apply_sharding = apply_sharding
+
         if samples_per_loader is None:
             if total_batch_size is None:
-                total_batch_size = sum(
-                    getattr(loader, 'batch_size', 32) 
-                    for loader in dataloaders
-                )
+                total_batch_size = sum(getattr(ld, 'batch_size', 32) for ld in dataloaders)
             samples_per_loader = [total_batch_size // self._num_loaders] * self._num_loaders
             samples_per_loader[-1] = total_batch_size - sum(samples_per_loader[:-1])
-        
+
         self.samples_per_loader = list(samples_per_loader)
         self.total_batch_size = sum(samples_per_loader)
 
-    @property
-    def last_loader_idx(self) -> Optional[Union[int, str]]:
-        """Get the index of the loader that produced the last batch."""
-        return self._last_loader_idx
-    
     @staticmethod
     def _extract_batch(batch) -> Optional[tuple]:
         """Extract (data, labels) from various batch formats."""
         if not isinstance(batch, tuple) or len(batch) != 2:
             return None
         first, second = batch
-        # Tagged batch: (tag, (data, labels))
         if isinstance(first, (int, str)) and isinstance(second, tuple) and len(second) == 2:
+            # Tagged batch: (tag, (data, labels))
             return second
         # Regular batch: (data, labels)
         return batch
-    
+
+    def _slice_batch(self, data, labels, num_samples: int):
+        """Slice data and labels to num_samples."""
+        batch_size = _get_batch_size(labels)
+        if batch_size <= num_samples:
+            return data, labels
+        if self._random_sample:
+            indices = _rng.choice(batch_size, size=num_samples, replace=False)
+        else:
+            indices = np.arange(num_samples)
+        return slice_data(data, indices), slice_data(labels, indices)
+
     def __iter__(self):
-        iterators = [iter(loader) for loader in self.dataloaders]
-        # Pre-allocate lists with fixed size
+        iterators = self._create_iterators()
         data_parts: list = [None] * self._num_loaders
         label_parts: list = [None] * self._num_loaders
 
         while True:
             all_valid = True
-
             for idx in range(self._num_loaders):
-                num_samples = self.samples_per_loader[idx]
                 try:
                     batch = next(iterators[idx])
-                    extracted = self._extract_batch(batch)
-                    
-                    if extracted is None:
-                        all_valid = False
-                        break
-
-                    data, labels = extracted
-
-                    batch_size = _get_batch_size(labels)  # Use labels (always an array)
-                    
-                    # Sample from batch when it's larger than needed
-                    if batch_size > num_samples:
-                        if self._random_sample:
-                            indices = _rng.choice(batch_size, size=num_samples, replace=False)
-                        else:
-                            indices = np.arange(num_samples)
-                        data_parts[idx] = slice_data(data, indices)
-                        label_parts[idx] = slice_data(labels, indices)
-                    else:
-                        data_parts[idx] = data
-                        label_parts[idx] = labels
-                        
                 except StopIteration:
                     return
-            
+                extracted = self._extract_batch(batch)
+                if extracted is None:
+                    all_valid = False
+                    break
+                data_parts[idx], label_parts[idx] = self._slice_batch(
+                    *extracted, self.samples_per_loader[idx]
+                )
+
             if not all_valid:
                 continue
-            from openpi.training.pytree_utils import apply_sharding
-            # Concatenate all parts
+
             combined_data = concat_data(data_parts)
             combined_labels = concat_data(label_parts)
-            if self._sharding is not None:
-                combined_data = apply_sharding(combined_data, self._sharding)
-                combined_labels = apply_sharding(combined_labels, self._sharding)
-            
+            if self._apply_sharding is not None:
+                combined_data = self._apply_sharding(combined_data, self._sharding)
+                combined_labels = self._apply_sharding(combined_labels, self._sharding)
+
             self._last_loader_idx = "mixed"
             yield combined_data, combined_labels
-    
+
     def __len__(self):
-        return min(len(loader) for loader in self.dataloaders)
+        return min(len(ld) for ld in self.dataloaders)
 
 
 # =============================================================================
@@ -917,51 +836,39 @@ class CurriculumDataLoader(ComposableDataLoader):
         ...     batches_per_stage=[100, 200, 300]
         ... )
     """
-    
+
     def __init__(
-        self, 
-        dataloaders: Sequence[AnyDataLoader], 
+        self,
+        dataloaders: Sequence[AnyDataLoader],
         stages: Sequence[Sequence[int]],
-        batches_per_stage: Sequence[int]
+        batches_per_stage: Sequence[int],
     ):
-        self.dataloaders = list(dataloaders)
-        self.stages = [list(stage) for stage in stages]
+        super().__init__(dataloaders)
+        self.stages = [list(s) for s in stages]
         self.batches_per_stage = list(batches_per_stage)
         self.current_stage = 0
         self.batches_in_stage = 0
-        self._last_loader_idx: Optional[int] = None
 
-    @property
-    def last_loader_idx(self) -> Optional[int]:
-        """Get the index of the loader that produced the last batch."""
-        return self._last_loader_idx
-    
     def __iter__(self):
-        iterators = [iter(loader) for loader in self.dataloaders]
-        total_batches = sum(self.batches_per_stage)
-        batches_yielded = 0
-        
-        while batches_yielded < total_batches:
-            active_loaders = self.stages[self.current_stage]
-            loader_idx = _rng.choice(active_loaders)
-            
+        iterators = self._create_iterators()
+        total = len(self)
+        yielded = 0
+
+        while yielded < total:
+            idx = int(_rng.choice(self.stages[self.current_stage]))
             try:
-                batch = next(iterators[loader_idx])
-                self._last_loader_idx = loader_idx
-                yield batch
-                batches_yielded += 1
+                self._last_loader_idx = idx
+                yield next(iterators[idx])
+                yielded += 1
                 self.batches_in_stage += 1
-                
-                # Check for stage transition
-                if (self.batches_in_stage >= self.batches_per_stage[self.current_stage] and
-                    self.current_stage < len(self.stages) - 1):
+                if (self.batches_in_stage >= self.batches_per_stage[self.current_stage]
+                        and self.current_stage < len(self.stages) - 1):
                     self.current_stage += 1
                     self.batches_in_stage = 0
-                    
             except StopIteration:
                 # Restart exhausted loader
-                iterators[loader_idx] = iter(self.dataloaders[loader_idx])
-    
+                iterators[idx] = iter(self.dataloaders[idx])
+
     def __len__(self):
         return sum(self.batches_per_stage)
 
