@@ -30,6 +30,8 @@ import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+import openpi.training.composable_dataloader as composable_dataloader
+
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -473,13 +475,47 @@ class RLDSDroidDataConfig(DataConfigFactory):
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class LeRobotDROIDDataConfig(DataConfigFactory):
+    """
+    Example data config for custom DROID dataset in LeRobot format.
+    To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/exterior_image_2_left": "exterior_image_2_left",
+                        "observation/wrist_image_left": "wrist_image_left",
+                        "observation/joint_position": "joint_position",
+                        "observation/gripper_position": "gripper_position",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        # We assume joint *velocity* actions, so we should *not* apply an additional delta transform.
+        data_transforms = _transforms.Group(
+            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            outputs=[droid_policy.DroidOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
 # Recursive node: either a dataset (leaf) or another ComposableDataConfig (nested).
 ComposableNode = Union[DataConfigFactory, "ComposableDataConfig"]
-
-
-_VALID_STRATEGIES = frozenset({
-    "random", "proportional", "round_robin", "alternating", "tagged", "dynamic", "inbatch"
-})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -535,15 +571,20 @@ class ComposableDataConfig:
     # Whether to randomly sample from each batch (for inbatch strategy)
     # If True, randomly selects samples; if False, takes first N samples
     inbatch_random_sample: bool = False
-    
+
+    # Stop strategy for multi-source loaders: LONGEST (default) or SHORTEST.
+    # LONGEST: iterate until all loaders are fully consumed (shorter ones restart).
+    # SHORTEST: stop as soon as any loader exhausts.
+    stop_strategy: str = composable_dataloader.LONGEST 
+
     # Random seed for reproducibility
     seed: int | None = None
 
     def __post_init__(self) -> None:
-        if self.composition_strategy not in _VALID_STRATEGIES:
+        if self.composition_strategy not in composable_dataloader.VALID_COMPOSITION_STRATEGIES:
             raise ValueError(
                 f"Unknown composition_strategy '{self.composition_strategy}'. "
-                f"Valid options: {sorted(_VALID_STRATEGIES)}"
+                f"Valid options: {sorted(composable_dataloader.VALID_COMPOSITION_STRATEGIES)}"
             )
         if self.weights is not None and len(self.weights) != len(self.children):
             raise ValueError(
@@ -553,44 +594,6 @@ class ComposableDataConfig:
             raise ValueError(
                 f"task_names length ({len(self.task_names)}) must match children length ({len(self.children)})"
             )
-
-@dataclasses.dataclass(frozen=True)
-class LeRobotDROIDDataConfig(DataConfigFactory):
-    """
-    Example data config for custom DROID dataset in LeRobot format.
-    To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
-    """
-
-    @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/exterior_image_1_left": "exterior_image_1_left",
-                        "observation/exterior_image_2_left": "exterior_image_2_left",
-                        "observation/wrist_image_left": "wrist_image_left",
-                        "observation/joint_position": "joint_position",
-                        "observation/gripper_position": "gripper_position",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
-        # We assume joint *velocity* actions, so we should *not* apply an additional delta transform.
-        data_transforms = _transforms.Group(
-            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
-            outputs=[droid_policy.DroidOutputs()],
-        )
-        model_transforms = ModelTransformFactory()(model_config)
-
-        return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
-            repack_transforms=repack_transform,
-            data_transforms=data_transforms,
-            model_transforms=model_transforms,
-        )
 
 
 @dataclasses.dataclass(frozen=True)
