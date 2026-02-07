@@ -30,7 +30,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 import itertools
-from typing import Dict, Optional, Protocol, TypeVar, Union, runtime_checkable
+from typing import Callable, Dict, Optional, Protocol, TypeVar, Union, runtime_checkable
 import numpy as np
 import torch
 from torch.utils.data import DataLoader as TorchDataLoader, Dataset as TorchDataset
@@ -82,13 +82,21 @@ def get_rng() -> np.random.Generator:
     """
     return _rng
 
+
 __all__ = [
     # Random seed management
     "set_seed",
     "get_rng",
+    # Batch-count sentinels
+    "LONGEST",
+    "SHORTEST",
+    # Composition strategies
+    "VALID_COMPOSITION_STRATEGIES",
     # Protocols and base classes
     "BaseDataLoader",
     "ComposableDataLoader",
+    "MultiSourceDataLoader",
+    "SingleLoaderWrapper",
     "AnyDataLoader",
     # Concrete implementations
     "RoundRobinDataLoader",
@@ -100,9 +108,47 @@ __all__ = [
     "DynamicScheduleDataLoader",
     "InBatchMixDataLoader",
     "CurriculumDataLoader",
+    "RefreshableDataLoader",
     # Factory
     "Compose",
 ]
+
+# =============================================================================
+# Stop Strategy Sentinels
+# =============================================================================
+
+LONGEST: str = "longest"
+"""Use as ``stop_strategy=LONGEST`` — iteration continues until **every** child
+loader is fully traversed at least once.  Shorter loaders restart as needed."""
+
+SHORTEST: str = "shortest"
+"""Use as ``stop_strategy=SHORTEST`` — iteration stops as soon as the first
+child loader would exhaust.  No child loader needs to restart."""
+
+# =============================================================================
+# Composition Strategy Constants
+# =============================================================================
+
+VALID_COMPOSITION_STRATEGIES = frozenset({
+    "random",
+    "proportional",
+    "round_robin",
+    "alternating",
+    "tagged",
+    "dynamic",
+    "inbatch",
+})
+"""Valid composition strategy names for ComposableDataConfig.
+
+These correspond to the factory methods in the Compose class:
+- "random" → Compose.random()
+- "proportional" → Compose.proportional()
+- "round_robin" → Compose.round_robin()
+- "alternating" → Compose.alternating()
+- "tagged" → Compose.tagged()
+- "dynamic" → Compose.dynamic()
+- "inbatch" → Compose.inbatch()
+"""
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -142,100 +188,101 @@ AnyDataLoader = BaseDataLoader
 
 
 # =============================================================================
+# Utility Functions
+# =============================================================================
+
+def _normalize_weights(weights: Sequence[float]) -> np.ndarray:
+    """Normalize *weights* to a probability distribution (sums to 1).
+
+    Raises:
+        ValueError: If any weight is negative or all weights are zero.
+    """
+    w = np.asarray(weights, dtype=np.float64)
+    if (w < 0).any():
+        raise ValueError(f"Weights must be non-negative, got {weights}")
+    total = w.sum()
+    if total == 0:
+        raise ValueError("Weights must not all be zero")
+    return w / total
+
+
+def _weighted_choice(
+    num_loaders: int,
+    base_weights: np.ndarray,
+    active: np.ndarray,
+    buf: np.ndarray,
+) -> int:
+    """Pick a loader index via weighted random choice over active loaders.
+
+    Args:
+        num_loaders: Total number of loaders.
+        base_weights: Base weight array (not mutated).
+        active: Boolean mask of active loaders.
+        buf: Pre-allocated float64 buffer (len == num_loaders).
+
+    Returns:
+        Selected loader index, or -1 if no active loaders.
+    """
+    np.multiply(base_weights, active, out=buf)
+    total = buf.sum()
+    if total == 0:
+        return -1
+    buf /= total
+    return int(_rng.choice(num_loaders, p=buf))
+
+
+# =============================================================================
 # Abstract Base Class
 # =============================================================================
 
 class ComposableDataLoader(ABC, BaseDataLoader):
-    """Abstract base class for composable DataLoaders.
-    
-    This class provides the foundation for all composition strategies.
-    Subclasses must implement __iter__ and __len__.
-    
-    Key features:
-    - Explicitly inherits BaseDataLoader protocol
-    - Supports arbitrary nesting of composable loaders
-    - Compatible with PyTorch DataLoader
-    - Framework-agnostic design
-    - ``dataloaders``: child loader storage
-    - ``last_loader_idx``: tracks which child produced the last batch
-    - Default ``__len__`` (sum of child lengths, override if needed)
-    - ``_create_iterators`` / ``_normalize_weights`` helpers
+    """Minimal abstract base class for all composable DataLoaders.
 
-    Inheritance hierarchy:
+    Defines only the iteration contract (``__iter__``, ``__len__``) and
+    ``last_loader_idx`` tracking.  Concrete behaviour is added by the two
+    intermediate bases:
+
+    - ``MultiSourceDataLoader`` — for loaders that compose *multiple*
+      child DataLoaders (round-robin, random mix, proportional, …).
+    - ``SingleLoaderWrapper`` — for loaders that wrap *one* child
+      (source-tagging, refreshable epochs, …).
+
+    Inheritance hierarchy::
+
         BaseDataLoader (Protocol)
             ↑
         ComposableDataLoader (ABC)
-            ↑
-        RoundRobinDataLoader, RandomMixDataLoader, ...
-    
-    Examples:
-        >>> mixed = RandomMixDataLoader([loader_a, loader_b], weights=[0.7, 0.3])
-        >>> assert isinstance(mixed, BaseDataLoader)
-        >>> for batch in mixed:
-        ...     process(batch)
+            ├── MultiSourceDataLoader
+            │   ├── RoundRobinDataLoader
+            │   ├── RandomMixDataLoader
+            │   └── …
+            └── SingleLoaderWrapper
+                ├── SourceTaggedDataLoader
+                └── RefreshableDataLoader
     """
 
-    def __init__(self, dataloaders: Sequence[AnyDataLoader]):
-        self.dataloaders = list(dataloaders)
-        self._num_loaders = len(self.dataloaders)
-        self._last_loader_idx: Optional[Union[int, str]] = None
+    def __init__(self):
+        self._last_loader_idx: Optional[Union[int, str, Dict[int, int]]] = None
 
     @property
-    def last_loader_idx(self) -> Optional[Union[int, str]]:
-        """Index (or label) of the loader that produced the last batch."""
-        return self._last_loader_idx
+    def last_loader_idx(self) -> Optional[Union[int, str, Dict[int, int]]]:
+        """Index, label, or composition dict of the loader that produced the last batch.
 
-    # ------------------------------------------------------------------
-    # Helpers available to all subclasses
-    # ------------------------------------------------------------------
-
-    def _create_iterators(self) -> list:
-        """Create fresh iterators from all child loaders."""
-        return [iter(ld) for ld in self.dataloaders]
-
-    @staticmethod
-    def _normalize_weights(weights: Sequence[float]) -> np.ndarray:
-        """Normalize weights to a probability distribution."""
-        w = np.asarray(weights, dtype=np.float64)
-        return w / w.sum()
-
-    @staticmethod
-    def _weighted_choice(
-        num_loaders: int,
-        base_weights: np.ndarray,
-        active: np.ndarray,
-        buf: np.ndarray,
-    ) -> int:
-        """Pick a loader index via weighted random choice over active loaders.
-
-        Args:
-            num_loaders: Total number of loaders.
-            base_weights: Base weight array (not mutated).
-            active: Boolean mask of active loaders.
-            buf: Pre-allocated float64 buffer (len == num_loaders).
-
-        Returns:
-            Selected loader index, or -1 if no active loaders.
+        - ``int`` — single-source loaders (index of the child).
+        - ``str`` — e.g. ``"mixed"`` when no further detail is needed.
+        - ``Dict[int, int]`` — in-batch mix: ``{child_idx: sample_count}``.
         """
-        np.multiply(base_weights, active, out=buf)
-        total = buf.sum()
-        if total == 0:
-            return -1
-        buf /= total
-        return int(_rng.choice(num_loaders, p=buf))
-
-    # ------------------------------------------------------------------
-    # Default implementations (override in subclasses if needed)
-    # ------------------------------------------------------------------
+        return self._last_loader_idx
 
     @abstractmethod
     def __iter__(self) -> Iterator:
         """Return an iterator over batches."""
         ...
 
+    @abstractmethod
     def __len__(self) -> int:
-        """Default: sum of all child loader lengths."""
-        return sum(len(ld) for ld in self.dataloaders)
+        """Return the total number of batches."""
+        ...
 
     @staticmethod
     def is_dataloader(obj) -> bool:
@@ -244,10 +291,72 @@ class ComposableDataLoader(ABC, BaseDataLoader):
 
 
 # =============================================================================
+# Multi-Source Base Class
+# =============================================================================
+
+class MultiSourceDataLoader(ComposableDataLoader):
+    """Intermediate base for loaders that compose *multiple* child DataLoaders.
+
+    Provides:
+
+    - ``dataloaders`` / ``_num_loaders`` — child storage and count.
+    - ``_stop_strategy`` — ``LONGEST`` or ``SHORTEST`` termination control.
+    - ``_create_iterators()`` — convenience to build fresh iterators.
+    - A default ``__len__`` (sum of child lengths; override if needed).
+    """
+
+    def __init__(
+        self,
+        dataloaders: Sequence[AnyDataLoader],
+        stop_strategy: str = LONGEST,
+    ):
+        super().__init__()
+        self.dataloaders = list(dataloaders)
+        if not self.dataloaders:
+            raise ValueError("dataloaders must not be empty")
+        if stop_strategy not in (LONGEST, SHORTEST):
+            raise ValueError(
+                f"stop_strategy must be LONGEST or SHORTEST, got {stop_strategy!r}"
+            )
+        self._num_loaders = len(self.dataloaders)
+        self._stop_strategy = stop_strategy
+
+    def _create_iterators(self) -> list:
+        """Create fresh iterators from all child loaders."""
+        return [iter(ld) for ld in self.dataloaders]
+
+    def __len__(self) -> int:
+        """Default: sum of all child loader lengths."""
+        return sum(len(ld) for ld in self.dataloaders)
+
+
+# =============================================================================
+# Single-Loader Wrapper Base Class
+# =============================================================================
+
+class SingleLoaderWrapper(ComposableDataLoader):
+    """Intermediate base for loaders that wrap a *single* child DataLoader.
+
+    ``last_loader_idx`` automatically delegates to the inner loader,
+    enabling transparent pass-through of source tracking in nested
+    compositions.
+    """
+
+    def __init__(self, dataloader: AnyDataLoader):
+        super().__init__()
+        self._inner = dataloader
+
+    @property
+    def last_loader_idx(self) -> Optional[Union[int, str, Dict[int, int]]]:
+        """Delegate to the inner loader's ``last_loader_idx``."""
+        return getattr(self._inner, "last_loader_idx", self._last_loader_idx)
+
+
+# =============================================================================
 # Round-Robin DataLoader
 # =============================================================================
 
-class RoundRobinDataLoader(ComposableDataLoader):
+class RoundRobinDataLoader(MultiSourceDataLoader):
     """Cycle through DataLoaders sequentially, taking one batch from each.
     
     This loader iterates through all child loaders in order, yielding one
@@ -255,32 +364,37 @@ class RoundRobinDataLoader(ComposableDataLoader):
     
     Args:
         dataloaders: Sequence of DataLoaders to cycle through.
+        stop_strategy: ``LONGEST`` (default) — continue until all loaders
+            exhaust.  ``SHORTEST`` — stop as soon as any loader exhausts.
     
     Examples:
         >>> loader = RoundRobinDataLoader([loader_a, loader_b, loader_c])
         >>> # Yields: batch_a, batch_b, batch_c, batch_a, batch_b, ...
     """
 
-    def __init__(self, dataloaders: Sequence[AnyDataLoader]):
-        super().__init__(dataloaders)
+    def __init__(self, dataloaders: Sequence[AnyDataLoader], stop_strategy: str = LONGEST):
+        super().__init__(dataloaders, stop_strategy)
 
     def __iter__(self):
         iterators = self._create_iterators()
-        # Use boolean mask instead of removing elements (preserves original indices)
         active = [True] * self._num_loaders
         active_count = self._num_loaders
         idx = 0
 
         while active_count > 0:
-            # Skip inactive loaders
             while not active[idx]:
                 idx = (idx + 1) % self._num_loaders
             try:
-                self._last_loader_idx = idx
-                yield next(iterators[idx])
+                batch = next(iterators[idx])
             except StopIteration:
+                if self._stop_strategy == SHORTEST:
+                    return
                 active[idx] = False
                 active_count -= 1
+                idx = (idx + 1) % self._num_loaders
+                continue
+            self._last_loader_idx = idx
+            yield batch
             idx = (idx + 1) % self._num_loaders
 
 
@@ -288,7 +402,7 @@ class RoundRobinDataLoader(ComposableDataLoader):
 # Random/Weighted Mix DataLoader
 # =============================================================================
 
-class RandomMixDataLoader(ComposableDataLoader):
+class RandomMixDataLoader(MultiSourceDataLoader):
     """Sample batches randomly from DataLoaders with optional weights.
     
     This is the simplest approach for multi-dataset weighted sampling.
@@ -297,6 +411,8 @@ class RandomMixDataLoader(ComposableDataLoader):
     Args:
         dataloaders: Sequence of DataLoaders to sample from.
         weights: Optional sampling weights. If None, uniform weights are used.
+        stop_strategy: ``LONGEST`` (default) — continue until all loaders
+            exhaust.  ``SHORTEST`` — stop as soon as any loader exhausts.
     
     Examples:
         >>> # 70% probability from loader_a, 30% from loader_b
@@ -310,9 +426,10 @@ class RandomMixDataLoader(ComposableDataLoader):
         self,
         dataloaders: Sequence[AnyDataLoader],
         weights: Optional[Sequence[float]] = None,
+        stop_strategy: str = LONGEST,
     ):
-        super().__init__(dataloaders)
-        self.weights = self._normalize_weights(
+        super().__init__(dataloaders, stop_strategy)
+        self.weights = _normalize_weights(
             weights if weights is not None else [1.0] * self._num_loaders
         )
 
@@ -322,13 +439,15 @@ class RandomMixDataLoader(ComposableDataLoader):
         buf = np.empty(self._num_loaders, dtype=np.float64)
 
         while active.any():
-            idx = self._weighted_choice(self._num_loaders, self.weights, active, buf)
+            idx = _weighted_choice(self._num_loaders, self.weights, active, buf)
             if idx < 0:
                 break
             try:
                 self._last_loader_idx = idx
                 yield next(iterators[idx])
             except StopIteration:
+                if self._stop_strategy == SHORTEST:
+                    return
                 active[idx] = False
 
 
@@ -336,7 +455,7 @@ class RandomMixDataLoader(ComposableDataLoader):
 # Proportional Mix DataLoader
 # =============================================================================
 
-class ProportionalMixDataLoader(ComposableDataLoader):
+class ProportionalMixDataLoader(MultiSourceDataLoader):
     """Allocate a fixed number of batches to each DataLoader by ratio.
     
     Unlike RandomMixDataLoader which samples probabilistically, this loader
@@ -345,17 +464,33 @@ class ProportionalMixDataLoader(ComposableDataLoader):
     Uses an efficient online sampling algorithm (O(1) memory per step) instead
     of pre-generating the full schedule.
     
+    ``stop_strategy`` controls total iteration length:
+    
+    - ``LONGEST`` (default) — every child loader is traversed **at least
+      once**.  ``total = ceil(max(len(ld_i) / ratio_i))``.  Shorter loaders
+      restart as needed.
+    - ``SHORTEST`` — **no** child loader needs to restart.  Stops as soon as
+      the first loader would exhaust.
+      ``total = floor(min(len(ld_i) / ratio_i))``.
+    
     Args:
         dataloaders: Sequence of DataLoaders.
         ratios: Ratio of batches for each loader. If None, equal ratios.
-        max_batches: Total number of batches. If None, uses sum of loader lengths.
+        stop_strategy: ``LONGEST`` (default) or ``SHORTEST``.
     
     Examples:
-        >>> # Exactly 75% from loader_a, 25% from loader_b
+        >>> # LONGEST (default): all loaders fully covered
+        >>> # loader_a(100) ratio 0.75, loader_b(50) ratio 0.25
+        >>> # total = ceil(max(100/0.75, 50/0.25)) = 200
         >>> loader = ProportionalMixDataLoader(
-        ...     [loader_a, loader_b],
-        ...     ratios=[3, 1],
-        ...     max_batches=100
+        ...     [loader_a, loader_b], ratios=[3, 1],
+        ... )
+        >>>
+        >>> # SHORTEST: stop when the first loader would exhaust
+        >>> # total = floor(min(100/0.75, 50/0.25)) = 133
+        >>> loader = ProportionalMixDataLoader(
+        ...     [loader_a, loader_b], ratios=[3, 1],
+        ...     stop_strategy=SHORTEST,
         ... )
     """
 
@@ -363,13 +498,20 @@ class ProportionalMixDataLoader(ComposableDataLoader):
         self,
         dataloaders: Sequence[AnyDataLoader],
         ratios: Optional[Sequence[float]] = None,
-        max_batches: Optional[int] = None,
+        stop_strategy: str = LONGEST,
     ):
-        super().__init__(dataloaders)
-        ratios_arr = self._normalize_weights(
+        super().__init__(dataloaders, stop_strategy)
+        ratios_arr = _normalize_weights(
             ratios if ratios is not None else [1.0] * self._num_loaders
         )
-        total_batches = max_batches or sum(len(ld) for ld in self.dataloaders)
+        lengths_over_ratios = [len(ld) / r for ld, r in zip(self.dataloaders, ratios_arr)]
+
+        if stop_strategy == LONGEST:
+            # Every child loader traversed at least once (shortest restarts)
+            total_batches = int(np.ceil(max(lengths_over_ratios)))
+        else:
+            # SHORTEST: No child loader needs to restart (stop at first exhaustion)
+            total_batches = int(np.floor(min(lengths_over_ratios)))
         self.batches_per_loader = (ratios_arr * total_batches).astype(int)
         # Distribute remainder to last loader
         self.batches_per_loader[-1] += total_batches - int(self.batches_per_loader.sum())
@@ -379,8 +521,11 @@ class ProportionalMixDataLoader(ComposableDataLoader):
         iterators = self._create_iterators()
         remaining = self.batches_per_loader.astype(np.float64)
         buf = np.empty(self._num_loaders, dtype=np.float64)
+        dead = np.zeros(self._num_loaders, dtype=bool)
 
         for _ in range(self._total_batches):
+            # Zero out dead loaders so they are never selected
+            remaining[dead] = 0
             total = remaining.sum()
             if total <= 0:
                 break
@@ -391,8 +536,14 @@ class ProportionalMixDataLoader(ComposableDataLoader):
             try:
                 batch = next(iterators[idx])
             except StopIteration:
+                # Restart exhausted loader
                 iterators[idx] = iter(self.dataloaders[idx])
-                batch = next(iterators[idx])
+                try:
+                    batch = next(iterators[idx])
+                except StopIteration:
+                    # Loader is empty even after restart — mark dead
+                    dead[idx] = True
+                    continue
 
             self._last_loader_idx = idx
             yield batch
@@ -405,12 +556,15 @@ class ProportionalMixDataLoader(ComposableDataLoader):
 # Alternating DataLoader
 # =============================================================================
 
-class AlternatingDataLoader(ComposableDataLoader):
+class AlternatingDataLoader(MultiSourceDataLoader):
     """Alternate between DataLoaders using a custom pattern.
     
     Args:
         dataloaders: Sequence of DataLoaders.
         pattern: Index pattern for alternation. If None, cycles through indices.
+        stop_strategy: ``LONGEST`` (default) — continue until all
+            pattern-referenced loaders exhaust.  ``SHORTEST`` — stop as
+            soon as any loader exhausts.
     
     Examples:
         >>> # Pattern: A, A, B, A, A, B, ...
@@ -424,31 +578,63 @@ class AlternatingDataLoader(ComposableDataLoader):
         self,
         dataloaders: Sequence[AnyDataLoader],
         pattern: Optional[Sequence[int]] = None,
+        stop_strategy: str = LONGEST,
     ):
-        super().__init__(dataloaders)
+        super().__init__(dataloaders, stop_strategy)
         self.pattern = list(pattern) if pattern else list(range(self._num_loaders))
 
     def __iter__(self):
         iterators = self._create_iterators()
         pattern_cycle = itertools.cycle(self.pattern)
+        active = [True] * self._num_loaders
         total = len(self)
         yielded = 0
+        consecutive_skips = 0
 
         while yielded < total:
+            if consecutive_skips >= len(self.pattern):
+                break
             idx = next(pattern_cycle)
-            try:
-                self._last_loader_idx = idx
-                yield next(iterators[idx])
-                yielded += 1
-            except StopIteration:
+            if not active[idx]:
+                consecutive_skips += 1
                 continue
+            try:
+                batch = next(iterators[idx])
+            except StopIteration:
+                if self._stop_strategy == SHORTEST:
+                    return
+                active[idx] = False
+                consecutive_skips += 1
+                continue
+            self._last_loader_idx = idx
+            yield batch
+            yielded += 1
+            consecutive_skips = 0
+
+    def __len__(self) -> int:
+        """Estimate total batches based on stop strategy.
+
+        For ``LONGEST``, returns the sum of all child loader lengths (every
+        loader fully consumed).  For ``SHORTEST``, estimates batches until the
+        first loader exhausts, accounting for the pattern frequency.
+        """
+        if self._stop_strategy == SHORTEST:
+            from collections import Counter
+            freq = Counter(self.pattern)
+            # Batches until the first loader would exhaust, scaled by pattern frequency
+            return min(
+                len(self.dataloaders[idx]) * len(self.pattern) // count
+                for idx, count in freq.items()
+                if idx < self._num_loaders
+            )
+        return sum(len(ld) for ld in self.dataloaders)
 
 
 # =============================================================================
 # Task-Tagged DataLoader
 # =============================================================================
 
-class TaskTaggedDataLoader(ComposableDataLoader):
+class TaskTaggedDataLoader(MultiSourceDataLoader):
     """Add task/source labels to each batch for multi-task learning.
     
     Yields (task_name, batch) tuples, enabling task-specific processing
@@ -474,9 +660,10 @@ class TaskTaggedDataLoader(ComposableDataLoader):
         dataloaders: Dict[str, AnyDataLoader],
         sampling_strategy: str = 'random',
         propagate_tags: bool = False,
+        stop_strategy: str = LONGEST,
     ):
         # TaskTaggedDataLoader uses a dict; store list of values for base class
-        super().__init__(list(dataloaders.values()))
+        super().__init__(list(dataloaders.values()), stop_strategy)
         self._dataloaders_dict = dataloaders
         self.task_names = list(dataloaders.keys())
         self._task_to_idx = {name: i for i, name in enumerate(self.task_names)}
@@ -511,77 +698,18 @@ class TaskTaggedDataLoader(ComposableDataLoader):
                 else:
                     yield task, batch
             except StopIteration:
+                if self._stop_strategy == SHORTEST:
+                    return
                 active[task_idx] = False
                 active_count -= 1
                 active_list = [self.task_names[i] for i in range(self._num_loaders) if active[i]]
 
 
 # =============================================================================
-# Source-Tagged Wrapper
-# =============================================================================
-
-class SourceTaggedDataLoader(ComposableDataLoader):
-    """Wrap a DataLoader and tag each batch with its source name.
-
-    This wrapper is used at any level of a composed data loader tree to
-    attach source names. When stacked, it builds hierarchical source names
-    like ``"group_a/dataset_1"``.
-
-    Args:
-        dataloader: The DataLoader to wrap.
-        source_names: Names for each child loader (by index).
-
-    Notes:
-        - Maps ``last_loader_idx`` to ``source_names``.
-        - If the inner loader already yields ``(tag, batch)``, this wrapper
-          prefixes the resolved parent name: ``f"{parent}/{tag}"``.
-    """
-
-    def __init__(self, dataloader: ComposableDataLoader, source_names: Sequence[str]):
-        # SourceTaggedDataLoader wraps a single loader, not a list
-        super().__init__([dataloader])
-        self.dataloader = dataloader
-        self.source_names = list(source_names)
-
-    @property
-    def last_loader_idx(self) -> Optional[Union[int, str]]:
-        """Forward last_loader_idx from wrapped loader."""
-        return getattr(self.dataloader, "last_loader_idx", self._last_loader_idx)
-
-    def _resolve_source_name(self, idx: Optional[Union[int, str]]) -> str:
-        if isinstance(idx, str):
-            return idx
-        if isinstance(idx, int) and 0 <= idx < len(self.source_names):
-            return self.source_names[idx]
-        if idx is None and len(self.source_names) == 1:
-            return self.source_names[0]
-        return "unknown" if idx is None else f"dataset_{idx}"
-
-    def __iter__(self):
-        for batch in self.dataloader:
-            idx = getattr(self.dataloader, "last_loader_idx", None)
-            self._last_loader_idx = idx
-            parent_name = self._resolve_source_name(idx)
-
-            # Already tagged: (tag, payload) -> prefix with parent name
-            if isinstance(batch, tuple) and len(batch) == 2 and isinstance(batch[0], (int, str)):
-                tag, payload = batch
-                if parent_name != "unknown" and isinstance(tag, str) and not tag.startswith(f"{parent_name}/"):
-                    tag = f"{parent_name}/{tag}"
-                yield tag, payload
-            else:
-                # Untagged batch: attach parent name directly.
-                yield parent_name, batch
-
-    def __len__(self):
-        return len(self.dataloader)
-
-
-# =============================================================================
 # Dynamic Schedule DataLoader
 # =============================================================================
 
-class DynamicScheduleDataLoader(ComposableDataLoader):
+class DynamicScheduleDataLoader(MultiSourceDataLoader):
     """Dynamically adjust sampling weights based on training feedback.
     
     This loader enables adaptive sampling strategies where weights are
@@ -612,9 +740,10 @@ class DynamicScheduleDataLoader(ComposableDataLoader):
         dataloaders: Sequence[AnyDataLoader],
         initial_weights: Optional[Sequence[float]] = None,
         enable_tracking: bool = True,
+        stop_strategy: str = LONGEST,
     ):
-        super().__init__(dataloaders)
-        self.weights = self._normalize_weights(
+        super().__init__(dataloaders, stop_strategy)
+        self.weights = _normalize_weights(
             initial_weights if initial_weights is not None else [1.0] * self._num_loaders
         )
         self.enable_tracking = enable_tracking
@@ -642,7 +771,7 @@ class DynamicScheduleDataLoader(ComposableDataLoader):
         self.loader_performance[loader_idx].append(performance)
 
         avg_perfs = np.array([
-            np.mean(self.loader_performance.get(i, [0.5]))
+            np.mean(self.loader_performance[i] or [0.5])
             for i in range(self._num_loaders)
         ])
         if avg_perfs.max() > avg_perfs.min():
@@ -657,7 +786,7 @@ class DynamicScheduleDataLoader(ComposableDataLoader):
         buf = np.empty(self._num_loaders, dtype=np.float64)
 
         while active.any():
-            idx = self._weighted_choice(self._num_loaders, self.weights, active, buf)
+            idx = _weighted_choice(self._num_loaders, self.weights, active, buf)
             if idx < 0:
                 break
             try:
@@ -666,6 +795,8 @@ class DynamicScheduleDataLoader(ComposableDataLoader):
                 if self.enable_tracking:
                     self.batches_from_loader[idx] += 1
             except StopIteration:
+                if self._stop_strategy == SHORTEST:
+                    return
                 active[idx] = False
 
     def get_statistics(self) -> dict:
@@ -695,7 +826,7 @@ def _get_batch_size(data) -> int:
     raise TypeError(f"Cannot determine batch size for type {type(data)}")
 
 
-class InBatchMixDataLoader(ComposableDataLoader):
+class InBatchMixDataLoader(MultiSourceDataLoader):
     """Mix samples from multiple DataLoaders within a single batch.
     
     Supports multiple batch formats:
@@ -709,13 +840,22 @@ class InBatchMixDataLoader(ComposableDataLoader):
         total_batch_size: Alternative to samples_per_loader; divided equally.
         random_sample: If True, randomly sample from each batch when it's larger
             than needed. If False, take the first N samples. Default False.
+        stop_strategy: ``SHORTEST`` (default) — stop when any loader exhausts.
+            ``LONGEST`` — restart exhausted loaders so every loader is fully
+            consumed; total iterations = ``max(len(ld))``.
+    
+    After each yielded batch, ``last_loader_idx`` is set to a dict
+    ``{child_index: actual_sample_count}`` describing the composition,
+    e.g. ``{0: 16, 1: 8}``.  This is compatible with
+    ``SourceTaggedDataLoader`` which resolves the indices to source names.
     
     Examples:
-        >>> # Each batch contains 16 samples from each loader
         >>> loader = InBatchMixDataLoader(
         ...     [loader_a, loader_b],
-        ...     samples_per_loader=[16, 16]
+        ...     samples_per_loader=[16, 16],
         ... )
+        >>> for batch in loader:
+        ...     print(loader.last_loader_idx)  # e.g. {0: 16, 1: 16}
     """
 
     def __init__(
@@ -724,8 +864,9 @@ class InBatchMixDataLoader(ComposableDataLoader):
         samples_per_loader: Optional[Sequence[int]] = None,
         total_batch_size: Optional[int] = None,
         random_sample: bool = False,
+        stop_strategy: str = SHORTEST,
     ):
-        super().__init__(dataloaders)
+        super().__init__(dataloaders, stop_strategy)
         self._random_sample = random_sample
         self._sharding = next(
             (getattr(ld, "sharding", None) for ld in self.dataloaders if getattr(ld, "sharding", None) is not None),
@@ -758,39 +899,55 @@ class InBatchMixDataLoader(ComposableDataLoader):
         # Regular batch: (data, labels)
         return batch
 
-    def _slice_batch(self, data, labels, num_samples: int):
-        """Slice data and labels to num_samples."""
+    def _slice_batch(self, data, labels, num_samples: int) -> tuple:
+        """Slice data and labels to at most *num_samples*.
+
+        Returns:
+            ``(sliced_data, sliced_labels, actual_count)`` where
+            *actual_count* is ``min(batch_size, num_samples)``.
+        """
         batch_size = _get_batch_size(labels)
         if batch_size <= num_samples:
-            return data, labels
+            return data, labels, batch_size
         if self._random_sample:
             indices = _rng.choice(batch_size, size=num_samples, replace=False)
         else:
             indices = np.arange(num_samples)
-        return slice_data(data, indices), slice_data(labels, indices)
+        return slice_data(data, indices), slice_data(labels, indices), num_samples
 
     def __iter__(self):
         iterators = self._create_iterators()
         data_parts: list = [None] * self._num_loaders
         label_parts: list = [None] * self._num_loaders
+        counts: list = [0] * self._num_loaders
+        is_longest = self._stop_strategy == LONGEST
+        max_iters = max(len(ld) for ld in self.dataloaders) if is_longest else float('inf')
+        iters_done = 0
 
-        while True:
-            all_valid = True
+        while iters_done < max_iters:
             for idx in range(self._num_loaders):
                 try:
                     batch = next(iterators[idx])
                 except StopIteration:
-                    return
+                    if not is_longest:
+                        return  # SHORTEST: stop immediately
+                    # LONGEST: restart exhausted loader
+                    iterators[idx] = iter(self.dataloaders[idx])
+                    try:
+                        batch = next(iterators[idx])
+                    except StopIteration:
+                        return  # Empty even after restart
                 extracted = self._extract_batch(batch)
                 if extracted is None:
-                    all_valid = False
-                    break
-                data_parts[idx], label_parts[idx] = self._slice_batch(
-                    *extracted, self.samples_per_loader[idx]
+                    raise ValueError(
+                        f"InBatchMixDataLoader: loader {idx} yielded an incompatible "
+                        f"batch format (expected a (data, labels) tuple, got "
+                        f"{type(batch).__name__}). All child loaders must yield "
+                        f"(data, labels) or (tag, (data, labels)) tuples."
+                    )
+                data_parts[idx], label_parts[idx], counts[idx] = (
+                    self._slice_batch(*extracted, self.samples_per_loader[idx])
                 )
-
-            if not all_valid:
-                continue
 
             combined_data = concat_data(data_parts)
             combined_labels = concat_data(label_parts)
@@ -798,10 +955,13 @@ class InBatchMixDataLoader(ComposableDataLoader):
                 combined_data = self._apply_sharding(combined_data, self._sharding)
                 combined_labels = self._apply_sharding(combined_labels, self._sharding)
 
-            self._last_loader_idx = "mixed"
+            self._last_loader_idx = {i: counts[i] for i in range(self._num_loaders)}
             yield combined_data, combined_labels
+            iters_done += 1
 
     def __len__(self):
+        if self._stop_strategy == LONGEST:
+            return max(len(ld) for ld in self.dataloaders)
         return min(len(ld) for ld in self.dataloaders)
 
 
@@ -809,7 +969,7 @@ class InBatchMixDataLoader(ComposableDataLoader):
 # Curriculum Learning DataLoader
 # =============================================================================
 
-class CurriculumDataLoader(ComposableDataLoader):
+class CurriculumDataLoader(MultiSourceDataLoader):
     """Gradually introduce harder data through training stages.
     
     Implements curriculum learning by controlling which DataLoaders are
@@ -857,20 +1017,179 @@ class CurriculumDataLoader(ComposableDataLoader):
         while yielded < total:
             idx = int(_rng.choice(self.stages[self.current_stage]))
             try:
-                self._last_loader_idx = idx
-                yield next(iterators[idx])
-                yielded += 1
-                self.batches_in_stage += 1
-                if (self.batches_in_stage >= self.batches_per_stage[self.current_stage]
-                        and self.current_stage < len(self.stages) - 1):
-                    self.current_stage += 1
-                    self.batches_in_stage = 0
+                batch = next(iterators[idx])
             except StopIteration:
                 # Restart exhausted loader
                 iterators[idx] = iter(self.dataloaders[idx])
+                try:
+                    batch = next(iterators[idx])
+                except StopIteration:
+                    raise RuntimeError(
+                        f"CurriculumDataLoader: loader {idx} is empty even after "
+                        f"restart (stage {self.current_stage}). All loaders used "
+                        f"in stages must contain data."
+                    )
+            self._last_loader_idx = idx
+            yield batch
+            yielded += 1
+            self.batches_in_stage += 1
+            if (self.batches_in_stage >= self.batches_per_stage[self.current_stage]
+                    and self.current_stage < len(self.stages) - 1):
+                self.current_stage += 1
+                self.batches_in_stage = 0
 
     def __len__(self):
         return sum(self.batches_per_stage)
+
+
+# =============================================================================
+# Source-Tagged Wrapper
+# =============================================================================
+
+class SourceTaggedDataLoader(SingleLoaderWrapper):
+    """Wrap a DataLoader and tag each batch with its source name.
+
+    This wrapper is used at any level of a composed data loader tree to
+    attach source names. When stacked, it builds hierarchical source names
+    like ``"group_a/dataset_1"``.
+
+    Args:
+        dataloader: The DataLoader to wrap.
+        source_names: Names for each child loader (by index).
+
+    Notes:
+        - Maps ``last_loader_idx`` to ``source_names``.
+        - If the inner loader already yields ``(tag, batch)``, this wrapper
+          prefixes the resolved parent name: ``f"{parent}/{tag}"``.
+    """
+
+    def __init__(self, dataloader: ComposableDataLoader, source_names: Sequence[str]):
+        super().__init__(dataloader)
+        self.source_names = list(source_names)
+
+    def _resolve_source_name(self, idx: Optional[Union[int, str, Dict[int, int]]]) -> str:
+        """Resolve a ``last_loader_idx`` value to a human-readable name.
+
+        Handles three forms:
+        - ``int``  → looked up in ``source_names``.
+        - ``str``  → returned as-is.
+        - ``dict`` → in-batch mix composition ``{child_idx: count}``;
+          each key is recursively resolved and formatted as
+          ``"mixed(name_a:16,name_b:8)"``.
+        """
+        if isinstance(idx, dict):
+            parts = ", ".join(
+                f"{self._resolve_source_name(k)}:{v}"
+                for k, v in idx.items()
+            )
+            return f"mixed({parts})"
+        if isinstance(idx, str):
+            return idx
+        if isinstance(idx, int) and 0 <= idx < len(self.source_names):
+            return self.source_names[idx]
+        if idx is None and len(self.source_names) == 1:
+            return self.source_names[0]
+        return "unknown" if idx is None else f"dataset_{idx}"
+
+    def __iter__(self):
+        for batch in self._inner:
+            parent_name = self._resolve_source_name(self.last_loader_idx)
+
+            # Already tagged: (tag, payload) -> prefix with parent name
+            if isinstance(batch, tuple) and len(batch) == 2 and isinstance(batch[0], (int, str)):
+                tag, payload = batch
+                if parent_name != "unknown" and isinstance(tag, str) and not tag.startswith(f"{parent_name}/"):
+                    tag = f"{parent_name}/{tag}"
+                yield tag, payload
+            else:
+                # Untagged batch: attach parent name directly.
+                yield parent_name, batch
+
+    def __len__(self):
+        return len(self._inner)
+
+
+# =============================================================================
+# Refreshable DataLoader Wrapper
+# =============================================================================
+
+class RefreshableDataLoader(SingleLoaderWrapper):
+    """Wrap a DataLoader and trigger a user-specified refresh callback after specified epochs.
+
+    This is useful for scenarios like re-shuffling data, rotating through
+    dataset shards, updating sampling weights, or refreshing remote dataset
+    connections between epochs.
+
+    The wrapper iterates through the inner loader normally. When the inner
+    loader is exhausted and the epoch interval condition is met, ``on_refresh``
+    is called before the next iteration begins. If ``num_epochs`` is set, the
+    loader will automatically restart for that many epochs; if ``None``, the
+    loader iterates indefinitely (useful for infinite training loops).
+
+    Args:
+        dataloader: The DataLoader to wrap.
+        on_refresh: Callback invoked after the specified epoch interval.
+            Receives the current epoch index (0-based) and the wrapper
+            instance itself. Return value is ignored.
+        refresh_every: Invoke ``on_refresh`` every this many epochs.
+            Defaults to 1 (refresh after every epoch). For example, if
+            ``refresh_every=3``, the callback fires after epochs 2, 5, 8, …
+            (i.e. after every 3rd completed epoch, 0-indexed).
+        num_epochs: Number of epochs to iterate. If ``None``, iterate
+            indefinitely (never stops). If set, the inner loader will be
+            re-iterated ``num_epochs`` times.
+
+    Attributes:
+        epoch: Current epoch index (0-based), incremented each epoch.
+
+    Examples:
+        >>> def my_refresh(epoch, loader):
+        ...     print(f"Epoch {epoch} done, refreshing...")
+        ...     # e.g. reshuffle, swap dataset shard, etc.
+        >>>
+        >>> # Refresh after every 3 epochs, run for 9 epochs total
+        >>> loader = RefreshableDataLoader(
+        ...     train_loader,
+        ...     on_refresh=my_refresh,
+        ...     refresh_every=3,
+        ...     num_epochs=9,
+        ... )
+        >>> for batch in loader:
+        ...     train_step(batch)
+    """
+
+    def __init__(
+        self,
+        dataloader: AnyDataLoader,
+        on_refresh: Optional[Callable[..., None]] = None,
+        refresh_every: int = 1,
+        num_epochs: Optional[int] = None,
+    ):
+        super().__init__(dataloader)
+        self._on_refresh = on_refresh or (lambda *args, **kwargs: None)
+        self._num_epochs = num_epochs
+        if refresh_every < 1:
+            raise ValueError(f"refresh_every must be >= 1, got {refresh_every}")
+        self._refresh_every = refresh_every
+        self.epoch: int = 0
+
+    def __iter__(self):
+        epoch_iter = range(self._num_epochs) if self._num_epochs is not None else itertools.count()
+        for ep in epoch_iter:
+            self.epoch = ep
+            for batch in self._inner:
+                yield batch
+            # Inner loader exhausted — invoke refresh callback at the specified interval
+            if (ep + 1) % self._refresh_every == 0:
+                self._on_refresh(ep, self)
+
+    def __len__(self):
+        if self._num_epochs is None:
+            raise TypeError(
+                "RefreshableDataLoader with num_epochs=None (infinite) has no len(). "
+                "Set num_epochs to a finite value to use len()."
+            )
+        return self._num_epochs * len(self._inner)
 
 
 # =============================================================================
@@ -899,58 +1218,72 @@ class Compose:
     """
     
     @staticmethod
-    def round_robin(*loaders: AnyDataLoader) -> RoundRobinDataLoader:
+    def round_robin(
+        *loaders: AnyDataLoader,
+        stop_strategy: str = LONGEST,
+    ) -> RoundRobinDataLoader:
         """Create a round-robin DataLoader."""
-        return RoundRobinDataLoader(list(loaders))
+        return RoundRobinDataLoader(list(loaders), stop_strategy=stop_strategy)
     
     @staticmethod
     def random(
         *loaders: AnyDataLoader, 
-        weights: Optional[Sequence[float]] = None
+        weights: Optional[Sequence[float]] = None,
+        stop_strategy: str = LONGEST,
     ) -> RandomMixDataLoader:
         """Create a weighted random mixing DataLoader."""
-        return RandomMixDataLoader(list(loaders), weights=weights)
+        return RandomMixDataLoader(list(loaders), weights=weights, stop_strategy=stop_strategy)
     
     @staticmethod
     def proportional(
         *loaders: AnyDataLoader,
         ratios: Optional[Sequence[float]] = None,
-        max_batches: Optional[int] = None
+        stop_strategy: str = LONGEST,
     ) -> ProportionalMixDataLoader:
-        """Create a proportional allocation DataLoader."""
-        return ProportionalMixDataLoader(list(loaders), ratios=ratios, max_batches=max_batches)
+        """Create a proportional allocation DataLoader.
+
+        ``stop_strategy`` accepts ``LONGEST`` (default) or ``SHORTEST``.
+        """
+        return ProportionalMixDataLoader(list(loaders), ratios=ratios, stop_strategy=stop_strategy)
     
     @staticmethod
     def alternating(
         *loaders: AnyDataLoader,
-        pattern: Optional[Sequence[int]] = None
+        pattern: Optional[Sequence[int]] = None,
+        stop_strategy: str = LONGEST,
     ) -> AlternatingDataLoader:
         """Create an alternating pattern DataLoader."""
-        return AlternatingDataLoader(list(loaders), pattern=pattern)
+        return AlternatingDataLoader(list(loaders), pattern=pattern, stop_strategy=stop_strategy)
     
     @staticmethod
     def tagged(
         loaders_dict: Dict[str, AnyDataLoader],
         sampling_strategy: str = 'random',
-        propagate_tags: bool = False
+        propagate_tags: bool = False,
+        stop_strategy: str = LONGEST,
     ) -> TaskTaggedDataLoader:
         """Create a task-tagged DataLoader."""
-        return TaskTaggedDataLoader(loaders_dict, sampling_strategy, propagate_tags)
+        return TaskTaggedDataLoader(
+            loaders_dict, sampling_strategy, propagate_tags, stop_strategy=stop_strategy,
+        )
     
     @staticmethod
     def dynamic(
         *loaders: AnyDataLoader,
         initial_weights: Optional[Sequence[float]] = None,
-        enable_tracking: bool = True
+        enable_tracking: bool = True,
+        stop_strategy: str = LONGEST,
     ) -> DynamicScheduleDataLoader:
         """Create a dynamic scheduling DataLoader."""
-        return DynamicScheduleDataLoader(list(loaders), initial_weights, enable_tracking)
+        return DynamicScheduleDataLoader(
+            list(loaders), initial_weights, enable_tracking, stop_strategy=stop_strategy,
+        )
     
     @staticmethod
     def curriculum(
         *loaders: AnyDataLoader,
         stages: Sequence[Sequence[int]],
-        batches_per_stage: Sequence[int]
+        batches_per_stage: Sequence[int],
     ) -> CurriculumDataLoader:
         """Create a curriculum learning DataLoader."""
         return CurriculumDataLoader(list(loaders), stages, batches_per_stage)
@@ -959,10 +1292,26 @@ class Compose:
     def inbatch(
         *loaders: AnyDataLoader,
         samples_per_loader: Optional[Sequence[int]] = None,
-        random_sample: bool = False
+        random_sample: bool = False,
+        stop_strategy: str = SHORTEST,
     ) -> InBatchMixDataLoader:
         """Create an in-batch mixing DataLoader."""
-        return InBatchMixDataLoader(list(loaders), samples_per_loader, random_sample=random_sample)
+        return InBatchMixDataLoader(
+            list(loaders), samples_per_loader,
+            random_sample=random_sample, stop_strategy=stop_strategy,
+        )
+
+    @staticmethod
+    def refreshable(
+        loader: AnyDataLoader,
+        on_refresh: Optional[Callable[..., None]] = None,
+        refresh_every: int = 1,
+        num_epochs: Optional[int] = None,
+    ) -> RefreshableDataLoader:
+        """Create a refreshable DataLoader that calls on_refresh at specified epoch intervals."""
+        return RefreshableDataLoader(
+            loader, on_refresh=on_refresh, refresh_every=refresh_every, num_epochs=num_epochs
+        )
 
 
 # =============================================================================
@@ -1014,8 +1363,8 @@ def example_basic_usage():
     print(f"  6 batches from: {[b['label'][0] for b in batches]}")
     
     # 1.3 Proportional
-    print("\n[1.3] Proportional - easy:hard = 3:1, 20 batches total")
-    prop = Compose.proportional(easy, hard, ratios=[3, 1], max_batches=20)
+    print("\n[1.3] Proportional - easy:hard = 3:1 (LONGEST)")
+    prop = Compose.proportional(easy, hard, ratios=[3, 1])
     print(f"  Allocation: easy={prop.batches_per_loader[0]}, hard={prop.batches_per_loader[1]}")
 
 
@@ -1033,7 +1382,7 @@ def example_nested_composition():
     print("           Inner: 60:40 weighted random")
     
     inner = Compose.random(easy, medium, weights=[0.6, 0.4])
-    outer = Compose.proportional(inner, hard, ratios=[2, 1], max_batches=30)
+    outer = Compose.proportional(inner, hard, ratios=[2, 1])
     
     print(f"\n  Total batches: {len(outer)}")
     print(f"  Allocation: inner={outer.batches_per_loader[0]}, hard={outer.batches_per_loader[1]}")
@@ -1148,7 +1497,6 @@ def example_training_loop():
     train_loader = Compose.proportional(
         source_mix, loaders["hard"],
         ratios=[7, 3],
-        max_batches=20
     )
     
     print("\nComposition structure:")

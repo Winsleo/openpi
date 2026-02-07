@@ -762,26 +762,23 @@ def _build_composable_from_node(
     weights = node.weights
     pattern = node.pattern
     task_names = node.task_names
+    stop_strategy = node.stop_strategy
     num_loaders = len(child_loaders)
 
     if strategy == "random":
-        composed = composable.Compose.random(*child_loaders, weights=weights)
+        composed = composable.Compose.random(*child_loaders, weights=weights, stop_strategy=stop_strategy)
     elif strategy == "proportional":
-        composed = composable.Compose.proportional(
-            *child_loaders,
-            ratios=weights,
-            max_batches=num_batches,
-        )
+        composed = composable.Compose.proportional(*child_loaders, ratios=weights, stop_strategy=stop_strategy)
     elif strategy == "round_robin":
-        composed = composable.Compose.round_robin(*child_loaders)
+        composed = composable.Compose.round_robin(*child_loaders, stop_strategy=stop_strategy)
     elif strategy == "alternating":
-        composed = composable.Compose.alternating(*child_loaders, pattern=pattern)
+        composed = composable.Compose.alternating(*child_loaders, pattern=pattern, stop_strategy=stop_strategy)
     elif strategy == "tagged":
         names = task_names or _unique_source_names(inputs)
         loaders_dict = dict(zip(names, child_loaders))
-        composed = composable.Compose.tagged(loaders_dict, sampling_strategy="random")
+        composed = composable.Compose.tagged(loaders_dict, sampling_strategy="random", stop_strategy=stop_strategy)
     elif strategy == "dynamic":
-        composed = composable.Compose.dynamic(*child_loaders, initial_weights=weights)
+        composed = composable.Compose.dynamic(*child_loaders, initial_weights=weights, stop_strategy=stop_strategy)
     elif strategy == "inbatch":
         samples_per_loader = _compute_samples_per_loader(weights, num_loaders, config.batch_size)
         logging.info(
@@ -792,6 +789,7 @@ def _build_composable_from_node(
             *child_loaders,
             samples_per_loader=samples_per_loader,
             random_sample=node.inbatch_random_sample,
+            stop_strategy=stop_strategy,
         )
     else:
         raise ValueError(f"Unknown composition strategy: {strategy}")
