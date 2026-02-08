@@ -7,7 +7,7 @@ import difflib
 import logging
 import os
 import pathlib
-from typing import Any, Literal, Protocol, TypeAlias, List, Union
+from typing import Any, Literal, Protocol, TypeAlias, Union
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -104,7 +104,7 @@ class DataConfig:
     # Only used for B1K data loader.
     behavior_dataset_root: str | None = None
     # episodes index to use for training 
-    episodes_index : List[int] | None = None
+    episodes_index : list[int] | None = None
 
 
 class GroupFactory(Protocol):
@@ -703,7 +703,7 @@ class TrainConfig:
     val_num_batches: int = 10
     # Optionally, repo_id for validation set (if different from train)
     val_repo_id: str | None = None
-    val_episodes_index: List[int] | None = None
+    val_episodes_index: list[int] | None = None
 
     @property
     def assets_dirs(self) -> pathlib.Path:
