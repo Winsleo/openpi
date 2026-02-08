@@ -28,9 +28,9 @@ Example:
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 import itertools
-from typing import Callable, Dict, Optional, Protocol, TypeVar, Union, runtime_checkable
+from typing import Optional, Protocol, TypeVar, Union, runtime_checkable
 import numpy as np
 import torch
 from torch.utils.data import DataLoader as TorchDataLoader, Dataset as TorchDataset
@@ -262,15 +262,15 @@ class ComposableDataLoader(ABC, BaseDataLoader):
     """
 
     def __init__(self):
-        self._last_loader_idx: Optional[Union[int, str, Dict[int, int]]] = None
+        self._last_loader_idx: Optional[Union[int, str, dict[int, int]]] = None
 
     @property
-    def last_loader_idx(self) -> Optional[Union[int, str, Dict[int, int]]]:
+    def last_loader_idx(self) -> Optional[Union[int, str, dict[int, int]]]:
         """Index, label, or composition dict of the loader that produced the last batch.
 
         - ``int`` — single-source loaders (index of the child).
         - ``str`` — e.g. ``"mixed"`` when no further detail is needed.
-        - ``Dict[int, int]`` — in-batch mix: ``{child_idx: sample_count}``.
+        - ``dict[int, int]`` — in-batch mix: ``{child_idx: sample_count}``.
         """
         return self._last_loader_idx
 
@@ -347,7 +347,7 @@ class SingleLoaderWrapper(ComposableDataLoader):
         self._inner = dataloader
 
     @property
-    def last_loader_idx(self) -> Optional[Union[int, str, Dict[int, int]]]:
+    def last_loader_idx(self) -> Optional[Union[int, str, dict[int, int]]]:
         """Delegate to the inner loader's ``last_loader_idx``."""
         return getattr(self._inner, "last_loader_idx", self._last_loader_idx)
 
@@ -657,7 +657,7 @@ class TaskTaggedDataLoader(MultiSourceDataLoader):
 
     def __init__(
         self,
-        dataloaders: Dict[str, AnyDataLoader],
+        dataloaders: dict[str, AnyDataLoader],
         sampling_strategy: str = 'random',
         propagate_tags: bool = False,
         stop_strategy: str = LONGEST,
@@ -747,7 +747,7 @@ class DynamicScheduleDataLoader(MultiSourceDataLoader):
             initial_weights if initial_weights is not None else [1.0] * self._num_loaders
         )
         self.enable_tracking = enable_tracking
-        self.loader_performance: Dict[int, list] = defaultdict(list)
+        self.loader_performance: dict[int, list] = defaultdict(list)
         self.batches_from_loader = [0] * self._num_loaders
 
     def update_weights(
@@ -1067,7 +1067,7 @@ class SourceTaggedDataLoader(SingleLoaderWrapper):
         super().__init__(dataloader)
         self.source_names = list(source_names)
 
-    def _resolve_source_name(self, idx: Optional[Union[int, str, Dict[int, int]]]) -> str:
+    def _resolve_source_name(self, idx: Optional[Union[int, str, dict[int, int]]]) -> str:
         """Resolve a ``last_loader_idx`` value to a human-readable name.
 
         Handles three forms:
@@ -1257,7 +1257,7 @@ class Compose:
     
     @staticmethod
     def tagged(
-        loaders_dict: Dict[str, AnyDataLoader],
+        loaders_dict: dict[str, AnyDataLoader],
         sampling_strategy: str = 'random',
         propagate_tags: bool = False,
         stop_strategy: str = LONGEST,
@@ -1318,7 +1318,7 @@ class Compose:
 # Examples and Testing
 # =============================================================================
 
-def _create_test_loaders() -> Dict[str, TorchDataLoader]:
+def _create_test_loaders() -> dict[str, TorchDataLoader]:
     """Create test DataLoaders for examples."""
     
     class SimpleDataset(TorchDataset):
