@@ -540,8 +540,13 @@ class ComposableDataConfig:
         - return_source: (root level only) wraps with SourceTaggedDataLoader to tag batches
         - refresh_every: (any level) when set, wraps with RefreshableDataLoader at that level
           (num_epochs controls iteration count: None = infinite, int = finite epochs)
+          (on_refresh provides optional callback: receives (epoch_index, loader_instance))
 
     Nested example:
+        def my_refresh_callback(epoch: int, loader):
+            print(f"Epoch {epoch} completed, refreshing data...")
+            # Custom logic: reshuffle, update weights, etc.
+
         ComposableDataConfig(
             composition_strategy="proportional",
             children=[
@@ -551,6 +556,7 @@ class ComposableDataConfig:
                     weights=[0.6, 0.4],
                     refresh_every=2,  # Enable RefreshableDataLoader, refresh every 2 epochs
                     num_epochs=5,  # This sub-tree iterates 5 epochs per outer epoch
+                    on_refresh=my_refresh_callback,  # Optional callback
                 ),
                 dataset_c,  # No refresh_every, so no RefreshableDataLoader here
             ],
@@ -590,8 +596,12 @@ class ComposableDataConfig:
     # refresh_every: If set (>= 1), enables RefreshableDataLoader with callback interval.
     #                If None (default), no RefreshableDataLoader wrapping.
     # num_epochs: Number of epochs to iterate (None = infinite, passed to RefreshableDataLoader).
+    # on_refresh: Optional callback(epoch_index, loader_instance) invoked after
+    #             each refresh interval. If None, uses no-op default.
+    #             Type: Callable[[int, Any], None] | None
     refresh_every: int | None = None
     num_epochs: int | None = None
+    on_refresh: tyro.conf.Suppress[Any] = None
     
     # Random seed for reproducibility
     seed: int | None = None
