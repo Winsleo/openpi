@@ -794,6 +794,16 @@ def _build_composable_from_node(
     else:
         raise ValueError(f"Unknown composition strategy: {strategy}")
 
+    # Wrap with RefreshableDataLoader if refresh_every is set at this level
+    # (must be done before SourceTagged so that source tags remain consistent across epochs)
+    if node.refresh_every is not None:
+        composed = composable.RefreshableDataLoader(
+            composed,
+            on_refresh=None,  # Use default no-op callback
+            refresh_every=node.refresh_every,
+            num_epochs=node.num_epochs,
+        )
+
     # Wrap intermediate nodes with SourceTaggedDataLoader only when return_source
     # is enabled. Root wrapping is handled by create_composable_data_loader.
     if return_source and not _is_root:
@@ -921,7 +931,18 @@ def create_composable_data_loader(
 
     # Log summary
     weights_info = f", weights={list(composable_config.weights)}" if composable_config.weights else ""
-    logging.info(f"Created composable data loader: strategy='{strategy}', children={len(children)}{weights_info}")
+    refresh_info = (
+        f", refresh_every={composable_config.refresh_every}"
+        if composable_config.refresh_every is not None else ""
+    )
+    epochs_info = (
+        f", num_epochs={composable_config.num_epochs}"
+        if composable_config.num_epochs is not None else ""
+    )
+    logging.info(
+        f"Created composable data loader: strategy='{strategy}', "
+        f"children={len(children)}{weights_info}{refresh_info}{epochs_info}"
+    )
 
     return ComposableDataLoaderWrapper(composed, primary_data_config, return_source=return_source)
 
