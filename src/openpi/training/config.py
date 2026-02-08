@@ -536,6 +536,11 @@ class ComposableDataConfig:
         - "dynamic": dynamically adjusted weights
         - "inbatch": mix samples within a single batch
 
+    Special features:
+        - return_source: (root level only) wraps with SourceTaggedDataLoader to tag batches
+        - refresh_every: (any level) when set, wraps with RefreshableDataLoader at that level
+          (num_epochs controls iteration count: None = infinite, int = finite epochs)
+
     Nested example:
         ComposableDataConfig(
             composition_strategy="proportional",
@@ -544,10 +549,14 @@ class ComposableDataConfig:
                     composition_strategy="random",
                     children=[dataset_a, dataset_b],
                     weights=[0.6, 0.4],
+                    refresh_every=2,  # Enable RefreshableDataLoader, refresh every 2 epochs
+                    num_epochs=5,  # This sub-tree iterates 5 epochs per outer epoch
                 ),
-                dataset_c,
+                dataset_c,  # No refresh_every, so no RefreshableDataLoader here
             ],
             weights=[2, 1],
+            refresh_every=1,  # Enable at root, refresh after every outer epoch
+            num_epochs=10,  # Outer level iterates 10 epochs
         )
     """
     # Child nodes (datasets or nested compositions)
@@ -575,8 +584,15 @@ class ComposableDataConfig:
     # Stop strategy for multi-source loaders: LONGEST (default) or SHORTEST.
     # LONGEST: iterate until all loaders are fully consumed (shorter ones restart).
     # SHORTEST: stop as soon as any loader exhausts.
-    stop_strategy: str = composable_dataloader.LONGEST 
-
+    stop_strategy: str = composable_dataloader.LONGEST
+    
+    # Refresh configuration (wraps with RefreshableDataLoader when refresh_every is set)
+    # refresh_every: If set (>= 1), enables RefreshableDataLoader with callback interval.
+    #                If None (default), no RefreshableDataLoader wrapping.
+    # num_epochs: Number of epochs to iterate (None = infinite, passed to RefreshableDataLoader).
+    refresh_every: int | None = None
+    num_epochs: int | None = None
+    
     # Random seed for reproducibility
     seed: int | None = None
 
@@ -594,6 +610,10 @@ class ComposableDataConfig:
             raise ValueError(
                 f"task_names length ({len(self.task_names)}) must match children length ({len(self.children)})"
             )
+        if self.refresh_every is not None and self.refresh_every < 1:
+            raise ValueError(f"refresh_every must be >= 1 or None, got {self.refresh_every}")
+        if self.num_epochs is not None and self.num_epochs < 1:
+            raise ValueError(f"num_epochs must be >= 1 or None, got {self.num_epochs}")
 
 
 @dataclasses.dataclass(frozen=True)
