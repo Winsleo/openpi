@@ -799,7 +799,7 @@ def _build_composable_from_node(
     if node.refresh_every is not None:
         composed = composable.RefreshableDataLoader(
             composed,
-            on_refresh=None,  # Use default no-op callback
+            on_refresh=node.on_refresh,
             refresh_every=node.refresh_every,
             num_epochs=node.num_epochs,
         )
