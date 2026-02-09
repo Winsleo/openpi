@@ -535,21 +535,15 @@ class TorchDataLoader:
 
     def __iter__(self):
         num_items = 0
-        while True:
-            data_iter = iter(self._data_loader)
-            while True:
-                if self._num_batches is not None and num_items >= self._num_batches:
-                    return
-                try:
-                    batch = next(data_iter)
-                except StopIteration:
-                    break  # We've exhausted the dataset. Create a new iterator and start over.
-                num_items += 1
-                # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
-                if self._sharding is not None:
-                    yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
-                else:
-                    yield jax.tree.map(torch.as_tensor, batch)
+        for batch in self._data_loader:
+            if self._num_batches is not None and num_items >= self._num_batches:
+                return
+            num_items += 1
+            # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
+            if self._sharding is not None:
+                yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+            else:
+                yield jax.tree.map(torch.as_tensor, batch)
 
     def __len__(self) -> int:
         """Return the number of batches.
