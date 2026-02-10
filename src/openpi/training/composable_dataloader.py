@@ -30,6 +30,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 import itertools
+import logging
 from typing import Optional, Protocol, TypeVar, Union, runtime_checkable
 import numpy as np
 import torch
@@ -1166,7 +1167,12 @@ class RefreshableDataLoader(SingleLoaderWrapper):
         num_epochs: Optional[int] = None,
     ):
         super().__init__(dataloader)
-        self._on_refresh = on_refresh or (lambda *args, **kwargs: None)
+        if on_refresh is None:
+            def default_refresh(epoch: int, loader) -> None:
+                logging.info(f"Epoch {epoch} done, refreshing...")
+            self._on_refresh = default_refresh
+        else:
+            self._on_refresh = on_refresh
         self._num_epochs = num_epochs
         if refresh_every < 1:
             raise ValueError(f"refresh_every must be >= 1, got {refresh_every}")
