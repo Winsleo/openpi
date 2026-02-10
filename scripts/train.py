@@ -459,7 +459,10 @@ def main(config: _config.TrainConfig):
         shuffle=True,
     )
     data_iter = iter(data_loader)
-    batch = next(data_iter)
+    try:
+        batch = next(data_iter)
+    except StopIteration:
+        raise ValueError("Data loader is empty - no data available for training")
     _, (init_obs, init_actions) = _unwrap_batch(batch)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info((init_obs, init_actions))}")
 
@@ -478,9 +481,9 @@ def main(config: _config.TrainConfig):
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
     
     trainable_params = train_state.params.filter(config.trainable_filter)
-    print("\n=== Trainable Parameters Summary ===")
+    logging.info("\n=== Trainable Parameters Summary ===")
     training_utils.print_trainable_params_info(train_state.params, trainable_params, config.trainable_filter)
-    print("=" * 50)
+    logging.info("=" * 50)
     
     # Setup gradient accumulation
     grad_accum_steps = getattr(config, 'gradient_accumulation_steps', 1)
@@ -530,76 +533,94 @@ def main(config: _config.TrainConfig):
             logging.info("Validation disabled (val_log_interval <= 0)")
 
     infos = []
-    for step in pbar:
-        source, (observation, actions) = _unwrap_batch(batch)
-        if source is not None:
-            pbar.write(f"Step {step}: data_source={source}")
-        with sharding.set_mesh(mesh):
-            if grad_accum_steps > 1:
-                # Gradient accumulation mode
-                accumulated_grads = None
-                accumulated_infos = []
+    try:
+        for step in pbar:
+            source, (observation, actions) = _unwrap_batch(batch)
+            if source is not None:
+                pbar.write(f"Step {step}: data_source={source}")
+            with sharding.set_mesh(mesh):
+                if grad_accum_steps > 1:
+                    # Gradient accumulation mode
+                    accumulated_grads = None
+                    accumulated_infos = []
 
-                for accum_step in range(grad_accum_steps):
-                    grads, grad_info = pcompute_grads(train_rng, train_state, (observation, actions))
-                    accumulated_infos.append(grad_info)
+                    for accum_step in range(grad_accum_steps):
+                        grads, grad_info = pcompute_grads(train_rng, train_state, (observation, actions))
+                        accumulated_infos.append(grad_info)
 
-                    # Accumulate gradients (average across accumulation steps)
-                    if accumulated_grads is None:
-                        accumulated_grads = grads
-                    else:
-                        accumulated_grads = jax.tree.map(
-                            lambda acc, g: acc + g, accumulated_grads, grads
-                        )
+                        # Accumulate gradients (average across accumulation steps)
+                        if accumulated_grads is None:
+                            accumulated_grads = grads
+                        else:
+                            accumulated_grads = jax.tree.map(
+                                lambda acc, g: acc + g, accumulated_grads, grads
+                            )
 
-                    # Get next batch for accumulation (except for last step)
-                    if accum_step < grad_accum_steps - 1:
-                        batch = next(data_iter)
-                        source, (observation, actions) = _unwrap_batch(batch)
-                        if source is not None:
-                            pbar.write(f"Step {step}: data_source={source} (accumulation step {accum_step + 1}/{grad_accum_steps})")
+                        # Get next batch for accumulation (except for last step)
+                        if accum_step < grad_accum_steps - 1:
+                            batch = next(data_iter)
+                            source, (observation, actions) = _unwrap_batch(batch)
+                            if source is not None:
+                                pbar.write(f"Step {step}: data_source={source} (accumulation step {accum_step + 1}/{grad_accum_steps})")
 
-                # Average the accumulated gradients
-                accumulated_grads = jax.tree.map(
-                    lambda g: g / grad_accum_steps, accumulated_grads
+                    # Average the accumulated gradients
+                    accumulated_grads = jax.tree.map(
+                        lambda g: g / grad_accum_steps, accumulated_grads
+                    )
+
+                    # Apply the accumulated gradients
+                    train_state, apply_info = papply_grads(train_state, accumulated_grads)
+
+                    # Combine info from all accumulation steps
+                    stacked_accum_infos = common_utils.stack_forest(accumulated_infos)
+                    info = {
+                        "loss": jnp.mean(stacked_accum_infos["loss"]),
+                        "grad_norm": jnp.mean(stacked_accum_infos["grad_norm"]),
+                        **apply_info,
+                    }
+                else:
+                    # Standard single-step training
+                    train_state, info = ptrain_step(train_rng, train_state, (observation, actions))
+
+            infos.append(info)
+            if step % config.log_interval == 0:
+                stacked_infos = common_utils.stack_forest(infos)
+                reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+                info_str = ", ".join(f"{k}={float(v):.4f}" for k, v in reduced_info.items())
+                pbar.write(f"Step {step}: {info_str}")
+                wandb.log(reduced_info, step=step)
+                infos = []
+
+            # Validation loss computation (if enabled)
+            if validation_enabled and step % config.val_log_interval == 0:
+                val_loss = compute_validation_loss(
+                    config, train_state, mesh, train_state_sharding, replicated_sharding, data_loader
                 )
+                if val_loss is not None:
+                    wandb.log({"val_loss": val_loss}, step=step)
+                    logging.info("Validation loss at step %d: %.4f", step, val_loss)
 
-                # Apply the accumulated gradients
-                train_state, apply_info = papply_grads(train_state, accumulated_grads)
+            batch = next(data_iter)
 
-                # Combine info from all accumulation steps
-                stacked_accum_infos = common_utils.stack_forest(accumulated_infos)
-                info = {
-                    "loss": jnp.mean(stacked_accum_infos["loss"]),
-                    "grad_norm": jnp.mean(stacked_accum_infos["grad_norm"]),
-                    **apply_info,
-                }
-            else:
-                # Standard single-step training
-                train_state, info = ptrain_step(train_rng, train_state, (observation, actions))
-
-        infos.append(info)
-        if step % config.log_interval == 0:
+            if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+    
+    except StopIteration:
+        # Data iterator exhausted - save final state and exit gracefully
+        final_step = int(train_state.step)
+        logging.info(f"Data iterator exhausted at step {final_step}. Saving final checkpoint and exiting gracefully.")
+        
+        # Log any remaining metrics
+        if infos:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={float(v):.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
-
-        # Validation loss computation (if enabled)
-        if validation_enabled and step % config.val_log_interval == 0:
-            val_loss = compute_validation_loss(
-                config, train_state, mesh, train_state_sharding, replicated_sharding, data_loader
-            )
-            if val_loss is not None:
-                wandb.log({"val_loss": val_loss}, step=step)
-                logging.info("Validation loss at step %d: %.4f", step, val_loss)
-
-        batch = next(data_iter)
-
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            logging.info(f"Final metrics: {info_str}")
+            wandb.log(reduced_info, step=final_step)
+        
+        # Save final checkpoint
+        _checkpoints.save_state(checkpoint_manager, train_state, data_loader, final_step)
+        logging.info(f"Training completed early at step {final_step} due to data exhaustion.")
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

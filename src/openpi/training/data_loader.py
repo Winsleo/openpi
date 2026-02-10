@@ -704,16 +704,20 @@ def _build_composable_from_node(
     num_batches: int | None,
     return_source: bool = False,
     _is_root: bool = True,
+    _depth: int = 0,
 ) -> tuple[composable.BaseDataLoader, _config.DataConfig]:
     """Recursively build a composable loader from a config node.
 
     Args:
         return_source: If True, wrap intermediate nodes with SourceTaggedDataLoader
             to enable hierarchical source names.
+        _depth: Internal parameter tracking nesting depth for logging indentation.
     
     Returns:
         (loader, primary_data_config) where primary_data_config is from the first leaf.
     """
+    indent = "  " * _depth
+    
     if isinstance(node, _config.DataConfigFactory):
         data_config = node.create(config.assets_dirs, config.model)
         train_config = _create_single_dataset_config(config, node)
@@ -725,6 +729,7 @@ def _build_composable_from_node(
             num_batches=None,
             skip_norm_stats=skip_norm_stats,
         )
+        logging.info(f"{indent}  +-- Dataset: {data_config.repo_id}")
         return loader, data_config
 
     # node is ComposableDataConfig
@@ -745,12 +750,11 @@ def _build_composable_from_node(
             num_batches=None,
             return_source=return_source,
             _is_root=False,
+            _depth=_depth + 1,
         )
         child_loaders.append(sub_loader)
         if primary_data_config is None:
             primary_data_config = sub_data_config
-        if isinstance(child, _config.DataConfigFactory):
-            logging.info(f"Created data loader {i} for {sub_data_config.repo_id}")
 
     strategy = node.composition_strategy
     weights = node.weights
@@ -788,6 +792,14 @@ def _build_composable_from_node(
     else:
         raise ValueError(f"Unknown composition strategy: {strategy}")
 
+    # Log composition info for this level
+    level_marker = "[ROOT]" if _is_root else "  |--"
+    weights_info = f" weights={list(weights)}" if weights else ""
+    stop_info = f" stop={stop_strategy}" if stop_strategy != composable.LONGEST else ""
+    logging.info(
+        f"{indent}{level_marker} Compose.{strategy}(children={num_loaders}{weights_info}{stop_info})"
+    )
+
     # Wrap with RefreshableDataLoader if refresh_every is set at this level
     # (must be done before SourceTagged so that source tags remain consistent across epochs)
     if node.refresh_every is not None:
@@ -797,12 +809,15 @@ def _build_composable_from_node(
             refresh_every=node.refresh_every,
             num_epochs=node.num_epochs,
         )
+        epochs_str = f"{node.num_epochs}" if node.num_epochs else "inf"
+        logging.info(f"{indent}   -> RefreshableDataLoader(epochs={epochs_str}, refresh_every={node.refresh_every})")
 
     # Wrap intermediate nodes with SourceTaggedDataLoader only when return_source
     # is enabled. Root wrapping is handled by create_composable_data_loader.
     if return_source and not _is_root:
         source_names = _unique_source_names(inputs)
         composed = composable.SourceTaggedDataLoader(composed, source_names)
+        logging.info(f"{indent}   -> SourceTaggedDataLoader(sources={source_names})")
 
     assert primary_data_config is not None
     return composed, primary_data_config
@@ -902,9 +917,13 @@ def create_composable_data_loader(
     """
     seed = composable_config.seed
     return_source = composable_config.return_source
+    
+    logging.info("=" * 70)
+    logging.info("Building composable data loader tree...")
     if seed is not None:
         composable.set_seed(seed)
-
+        logging.info(f"Set random seed: {seed}")
+    
     composed, primary_data_config = _build_composable_from_node(
         config,
         composable_config,
@@ -913,6 +932,7 @@ def create_composable_data_loader(
         skip_norm_stats=skip_norm_stats,
         num_batches=num_batches,
         return_source=return_source,
+        _depth=0,
     )
 
     strategy = composable_config.composition_strategy
@@ -922,21 +942,18 @@ def create_composable_data_loader(
     if return_source and strategy != "tagged":
         source_names = composable_config.task_names or _unique_source_names(children)
         composed = composable.SourceTaggedDataLoader(composed, source_names)
+        logging.info(f"[TAG] Root SourceTaggedDataLoader (sources={source_names})")
 
-    # Log summary
-    weights_info = f", weights={list(composable_config.weights)}" if composable_config.weights else ""
-    refresh_info = (
-        f", refresh_every={composable_config.refresh_every}"
-        if composable_config.refresh_every is not None else ""
-    )
-    epochs_info = (
-        f", num_epochs={composable_config.num_epochs}"
-        if composable_config.num_epochs is not None else ""
-    )
-    logging.info(
-        f"Created composable data loader: strategy='{strategy}', "
-        f"children={len(children)}{weights_info}{refresh_info}{epochs_info}"
-    )
+    logging.info("=" * 70)
+    logging.info(f"[SUCCESS] Composable data loader created successfully")
+    logging.info(f"  Primary dataset: {primary_data_config.repo_id}")
+    logging.info(f"  Total children: {len(children)}")
+    if composable_config.weights:
+        logging.info(f"  Root weights: {list(composable_config.weights)}")
+    if composable_config.refresh_every is not None:
+        epochs_str = f"{composable_config.num_epochs}" if composable_config.num_epochs else "inf"
+        logging.info(f"  Refresh config: every {composable_config.refresh_every} epochs (total: {epochs_str})")
+    logging.info("=" * 70)
 
     return ComposableDataLoaderWrapper(composed, primary_data_config, return_source=return_source)
 
