@@ -534,16 +534,26 @@ class TorchDataLoader:
         return self._data_loader
 
     def __iter__(self):
+        epoch = 0
         num_items = 0
-        for batch in self._data_loader:
-            if self._num_batches is not None and num_items >= self._num_batches:
+        while True:
+            if self._num_batches is None and epoch > 0:
                 return
-            num_items += 1
-            # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
-            if self._sharding is not None:
-                yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
-            else:
-                yield jax.tree.map(torch.as_tensor, batch)
+            data_iter = iter(self._data_loader)
+            while True:
+                if self._num_batches is not None and num_items >= self._num_batches:
+                    return
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    epoch += 1
+                    break  # We've exhausted the dataset. Create a new iterator and start over.
+                num_items += 1
+                # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
+                if self._sharding is not None:
+                    yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+                else:
+                    yield jax.tree.map(torch.as_tensor, batch)
 
     def __len__(self) -> int:
         """Return the number of batches.
@@ -602,8 +612,11 @@ class RLDSDataLoader:
         self._num_batches = num_batches
 
     def __iter__(self):
+        epoch = 0
         num_items = 0
         while True:
+            if self._num_batches is None and epoch > 0:
+                return
             data_iter = iter(self._dataset)
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:
@@ -611,6 +624,7 @@ class RLDSDataLoader:
                 try:
                     batch = next(data_iter)
                 except StopIteration:
+                    epoch += 1
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
@@ -726,7 +740,7 @@ def _build_composable_from_node(
             data_config=data_config,
             sharding=sharding,
             shuffle=shuffle,
-            num_batches=None,
+            num_batches=num_batches,
             skip_norm_stats=skip_norm_stats,
         )
         logging.info(f"{indent}  +-- Dataset: {data_config.repo_id}")
@@ -747,7 +761,7 @@ def _build_composable_from_node(
             sharding=sharding,
             shuffle=shuffle,
             skip_norm_stats=skip_norm_stats,
-            num_batches=None,
+            num_batches=num_batches,
             return_source=return_source,
             _is_root=False,
             _depth=_depth + 1,
