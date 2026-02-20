@@ -31,7 +31,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 import itertools
 import logging
-from typing import Optional, Protocol, TypeVar, Union, runtime_checkable
+from typing import Any, Optional, Protocol, TypeVar, Union, runtime_checkable
 import numpy as np
 import torch
 from torch.utils.data import DataLoader as TorchDataLoader, Dataset as TorchDataset
@@ -345,6 +345,15 @@ class SingleLoaderWrapper(ComposableDataLoader):
 
     def __init__(self, dataloader: AnyDataLoader):
         super().__init__()
+        self._inner = dataloader
+
+    @property
+    def inner(self) -> AnyDataLoader:
+        """The wrapped inner DataLoader."""
+        return self._inner
+
+    @inner.setter
+    def inner(self, dataloader: AnyDataLoader) -> None:
         self._inner = dataloader
 
     @property
@@ -1127,11 +1136,20 @@ class RefreshableDataLoader(SingleLoaderWrapper):
     loader will automatically restart for that many epochs; if ``None``, the
     loader iterates indefinitely (useful for infinite training loops).
 
+    The callback receives ``(epoch, wrapper)`` where *wrapper* is this
+    ``RefreshableDataLoader`` instance. You can modify the inner loader in
+    three ways:
+
+    1. **In-place mutation**: ``wrapper.inner.dataset = new_dataset``
+    2. **Property assignment**: ``wrapper.inner = new_loader``
+    3. **Return a new loader**: the return value, if not ``None``, replaces
+       the inner loader automatically.
+
     Args:
         dataloader: The DataLoader to wrap.
-        on_refresh: Callback invoked after the specified epoch interval.
-            Receives the current epoch index (0-based) and the wrapper
-            instance itself. Return value is ignored.
+        on_refresh: Callback ``(epoch, wrapper) -> Optional[AnyDataLoader]``.
+            If it returns a DataLoader, the inner loader is replaced;
+            otherwise only in-place / property mutations take effect.
         refresh_every: Invoke ``on_refresh`` every this many epochs.
             Defaults to 1 (refresh after every epoch). For example, if
             ``refresh_every=3``, the callback fires after epochs 2, 5, 8, …
@@ -1144,14 +1162,21 @@ class RefreshableDataLoader(SingleLoaderWrapper):
         epoch: Current epoch index (0-based), incremented each epoch.
 
     Examples:
-        >>> def my_refresh(epoch, loader):
-        ...     print(f"Epoch {epoch} done, refreshing...")
-        ...     # e.g. reshuffle, swap dataset shard, etc.
+        >>> # 1. In-place mutation
+        >>> def reshuffle(epoch, wrapper):
+        ...     wrapper.inner.dataset.shuffle()
         >>>
-        >>> # Refresh after every 3 epochs, run for 9 epochs total
+        >>> # 2. Property assignment
+        >>> def swap_loader(epoch, wrapper):
+        ...     wrapper.inner = build_new_loader(epoch)
+        >>>
+        >>> # 3. Return value replacement
+        >>> def rotate_shard(epoch, wrapper):
+        ...     return build_loader_for_shard(epoch % num_shards)
+        >>>
         >>> loader = RefreshableDataLoader(
         ...     train_loader,
-        ...     on_refresh=my_refresh,
+        ...     on_refresh=rotate_shard,
         ...     refresh_every=3,
         ...     num_epochs=9,
         ... )
@@ -1162,13 +1187,13 @@ class RefreshableDataLoader(SingleLoaderWrapper):
     def __init__(
         self,
         dataloader: AnyDataLoader,
-        on_refresh: Optional[Callable[..., None]] = None,
+        on_refresh: Optional[Callable[..., Any]] = None,
         refresh_every: int = 1,
         num_epochs: Optional[int] = None,
     ):
         super().__init__(dataloader)
         if on_refresh is None:
-            def default_refresh(epoch: int, loader) -> None:
+            def default_refresh(epoch: int, wrapper) -> None:
                 logging.info(f"Epoch {epoch} done, refreshing...")
             self._on_refresh = default_refresh
         else:
@@ -1185,9 +1210,10 @@ class RefreshableDataLoader(SingleLoaderWrapper):
             self.epoch = ep
             for batch in self._inner:
                 yield batch
-            # Inner loader exhausted — invoke refresh callback at the specified interval
             if (ep + 1) % self._refresh_every == 0:
-                self._on_refresh(ep, self)
+                result = self._on_refresh(ep, self)
+                if result is not None:
+                    self._inner = result
 
     def __len__(self):
         if self._num_epochs is None:
