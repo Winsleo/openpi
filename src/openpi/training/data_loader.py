@@ -786,7 +786,10 @@ def _build_composable_from_node(
     stop_strategy = node.stop_strategy
     num_loaders = len(child_loaders)
 
-    if strategy == "random":
+    # Single child: passthrough directly, no composition needed.
+    if num_loaders == 1:
+        composed = child_loaders[0]
+    elif strategy == "random":
         composed = composable.Compose.random(*child_loaders, weights=weights, stop_strategy=stop_strategy)
     elif strategy == "proportional":
         composed = composable.Compose.proportional(*child_loaders, ratios=weights, stop_strategy=stop_strategy)
@@ -815,13 +818,15 @@ def _build_composable_from_node(
     else:
         raise ValueError(f"Unknown composition strategy: {strategy}")
 
-    # Log composition info for this level
     level_marker = "[ROOT]" if _is_root else "  |--"
-    weights_info = f" weights={list(weights)}" if weights else ""
-    stop_info = f" stop={stop_strategy}" if stop_strategy != composable.LONGEST else ""
-    logging.info(
-        f"{indent}{level_marker} Compose.{strategy}(children={num_loaders}{weights_info}{stop_info})"
-    )
+    if num_loaders == 1:
+        logging.info(f"{indent}{level_marker} passthrough(children=1)")
+    else:
+        weights_info = f" weights={list(weights)}" if weights else ""
+        stop_info = f" stop={stop_strategy}" if stop_strategy != composable.LONGEST else ""
+        logging.info(
+            f"{indent}{level_marker} Compose.{strategy}(children={num_loaders}{weights_info}{stop_info})"
+        )
 
     # Wrap with RefreshableDataLoader if refresh_every is set at this level
     # (must be done before SourceTagged so that source tags remain consistent across epochs)
