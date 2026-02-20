@@ -4,6 +4,7 @@ import multiprocessing
 import os
 import typing
 from typing import Any, Literal, Protocol, SupportsIndex, TypeVar
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -155,7 +156,10 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
 
 
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig,
+    action_horizon: int, 
+    model_config: _model.BaseModelConfig,
+    root: str | Path | None = None,
 ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
@@ -164,9 +168,10 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=root,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
@@ -251,6 +256,7 @@ def create_data_loader(
     config: _config.TrainConfig,
     *,
     data_config: _config.DataConfig | None = None,
+    data_config_factory: _config.DataConfigFactory | None = None,
     sharding: jax.sharding.Sharding | None = None,
     shuffle: bool = False,
     num_batches: int | None = None,
@@ -262,6 +268,8 @@ def create_data_loader(
     Args:
         config: The training configuration.
         data_config: Optional pre-configured data config. If None, will be created from config.
+        data_config_factory: Optional factory to create data config. If provided and data_config
+            is None, used instead of config.data.
         sharding: The sharding to use for the data loader (JAX only).
         shuffle: Whether to shuffle the data.
         num_batches: Determines the number of batches to return.
@@ -285,7 +293,8 @@ def create_data_loader(
         )
     
     if data_config is None:
-        data_config = config.data.create(config.assets_dirs, config.model)
+        factory = data_config_factory or config.data
+        data_config = factory.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
@@ -733,16 +742,16 @@ def _build_composable_from_node(
     indent = "  " * _depth
     
     if isinstance(node, _config.DataConfigFactory):
-        data_config = node.create(config.assets_dirs, config.model)
         train_config = _create_single_dataset_config(config, node)
         loader = create_data_loader(
             train_config,
-            data_config=data_config,
+            data_config_factory=node,
             sharding=sharding,
             shuffle=shuffle,
             num_batches=num_batches,
             skip_norm_stats=skip_norm_stats,
         )
+        data_config = loader.data_config()
         logging.info(f"{indent}  +-- Dataset: {data_config.repo_id}")
         return loader, data_config
 
