@@ -361,6 +361,10 @@ class SingleLoaderWrapper(ComposableDataLoader):
         """Delegate to the inner loader's ``last_loader_idx``."""
         return getattr(self._inner, "last_loader_idx", self._last_loader_idx)
 
+    @property
+    def dataset(self):
+        return getattr(self._inner, "dataset", None)
+
 
 # =============================================================================
 # Round-Robin DataLoader
