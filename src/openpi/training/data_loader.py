@@ -549,27 +549,18 @@ class TorchDataLoader:
     def dataset(self) -> torch.utils.data.Dataset:
         return self._data_loader.dataset
 
+    @property
+    def sharding(self) -> jax.sharding.Sharding | None:
+        return self._sharding
+
     def __iter__(self):
-        epoch = 0
-        num_items = 0
-        while True:
-            if self._num_batches is None and epoch > 0:
-                return
-            data_iter = iter(self._data_loader)
-            while True:
-                if self._num_batches is not None and num_items >= self._num_batches:
-                    return
-                try:
-                    batch = next(data_iter)
-                except StopIteration:
-                    epoch += 1
-                    break  # We've exhausted the dataset. Create a new iterator and start over.
-                num_items += 1
-                # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
-                if self._sharding is not None:
-                    yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
-                else:
-                    yield jax.tree.map(torch.as_tensor, batch)
+        if self._sharding is not None:
+            transform = lambda batch: jax.tree.map(
+                lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch
+            )
+        else:
+            transform = lambda batch: jax.tree.map(torch.as_tensor, batch)
+        yield from _batched_iter(self._data_loader, self._num_batches, transform)
 
     def __len__(self) -> int:
         """Return the number of batches.
@@ -596,6 +587,32 @@ def _worker_init_fn(worker_id: int) -> None:
     # means that this approach will not work for selecting the backend.
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+
+
+def _batched_iter(source, num_batches: int | None, transform_fn):
+    """Iterate over *source* with an optional batch-count limit, looping if needed.
+
+    When *num_batches* is ``None`` the source is iterated exactly once.
+    Otherwise the source is re-iterated as needed until *num_batches*
+    batches have been yielded.  Each raw batch is passed through
+    *transform_fn* before being yielded.
+    """
+    epoch = 0
+    num_items = 0
+    while True:
+        if num_batches is None and epoch > 0:
+            return
+        data_iter = iter(source)
+        while True:
+            if num_batches is not None and num_items >= num_batches:
+                return
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                epoch += 1
+                break
+            num_items += 1
+            yield transform_fn(batch)
 
 
 class RLDSDataLoader:
@@ -631,82 +648,81 @@ class RLDSDataLoader:
     def dataset(self) -> DroidRldsDataset:
         return self._dataset
 
+    @property
+    def sharding(self) -> jax.sharding.Sharding | None:
+        return self._sharding
+
     def __iter__(self):
-        epoch = 0
-        num_items = 0
-        while True:
-            if self._num_batches is None and epoch > 0:
-                return
-            data_iter = iter(self._dataset)
-            while True:
-                if self._num_batches is not None and num_items >= self._num_batches:
-                    return
-                try:
-                    batch = next(data_iter)
-                except StopIteration:
-                    epoch += 1
-                    break  # We've exhausted the dataset. Create a new iterator and start over.
-                num_items += 1
-                yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+        transform = lambda batch: jax.tree.map(
+            lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch
+        )
+        yield from _batched_iter(self._dataset, self._num_batches, transform)
 
 
-class DataLoaderImpl(DataLoader):
-    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | RLDSDataLoader):
+class BaseDataLoaderAdapter:
+    """Common base for adapters that bridge low-level loaders to the DataLoader protocol.
+
+    Shared functionality: ``data_config``, ``__len__``, ``dataset``,
+    ``dataloader``, and ``sharding`` properties.  Subclasses only need to
+    implement ``__iter__``.
+    """
+
+    def __init__(self, data_config: _config.DataConfig, inner):
         self._data_config = data_config
-        self._data_loader = data_loader
+        self._inner = inner
 
     def data_config(self) -> _config.DataConfig:
         return self._data_config
 
-    def __iter__(self):
-        for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
-
     def __len__(self) -> int:
-        return len(self._data_loader)
-
-    @property
-    def sharding(self) -> jax.sharding.Sharding | None:
-        return getattr(self._data_loader, "_sharding", None)
+        return len(self._inner)
 
     @property
     def dataset(self):
-        return getattr(self._data_loader, "dataset", None)
+        return getattr(self._inner, "dataset", None)
+
+    @property
+    def sharding(self) -> jax.sharding.Sharding | None:
+        return getattr(self._inner, "sharding", None)
+
+    @property
+    def inner(self):
+        return self._inner
+
+    @property
+    def unwrapped(self):
+        """Unwrap all intermediate wrappers and return the innermost loader."""
+        return getattr(self.inner, "unwrapped", self.inner)
+
+
+class DataLoaderImpl(BaseDataLoaderAdapter):
+    def __iter__(self):
+        for batch in self._inner:
+            yield _model.Observation.from_dict(batch), batch["actions"]
 
 
 # =============================================================================
 # Composable DataLoader Support
 # =============================================================================
 
-class ComposableDataLoaderWrapper:
+class ComposableDataLoaderWrapper(BaseDataLoaderAdapter):
     """Wrapper that makes ComposableDataLoader compatible with openpi's DataLoader protocol.
-    
-    This wrapper converts the output batches from the composable dataloader to the format
-    expected by the training loop (Observation, Actions tuple).
+
+    Converts output batches from the composable dataloader to the
+    ``(Observation, Actions)`` format expected by the training loop.
     """
-    
+
     def __init__(
         self,
         composable_loader: composable.ComposableDataLoader,
         primary_data_config: _config.DataConfig,
         return_source: bool = False,
     ):
-        """Initialize the wrapper.
-        
-        Args:
-            composable_loader: The composed DataLoader instance.
-            primary_data_config: The data config from the primary/first dataset.
-                Used to provide norm_stats and other config for the training loop.
-        """
-        self._composable_loader = composable_loader
-        self._data_config = primary_data_config
+        super().__init__(primary_data_config, composable_loader)
         self._return_source = return_source
 
-    def data_config(self) -> _config.DataConfig:
-        return self._data_config
-    
     def __iter__(self):
-        for batch in self._composable_loader:
+        for batch in self._inner:
             obs, actions, source = self._parse_batch(batch)
             if self._return_source and source is not None:
                 yield source, (obs, actions)
@@ -727,13 +743,6 @@ class ComposableDataLoaderWrapper:
             # Raw dict batch
             obs, actions = _model.Observation.from_dict(batch), batch["actions"]
         return obs, actions, source
-    
-    def __len__(self) -> int:
-        return len(self._composable_loader)
-
-    @property
-    def dataset(self):
-        return getattr(self._composable_loader, "dataset", None)
 
 
 def _build_composable_from_node(
