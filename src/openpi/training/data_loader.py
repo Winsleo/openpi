@@ -297,6 +297,9 @@ def create_data_loader(
         data_config = factory.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
+    if data_config.num_batches is not None:
+        num_batches = data_config.num_batches
+
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,
@@ -542,6 +545,10 @@ class TorchDataLoader:
     def torch_loader(self) -> torch.utils.data.DataLoader:
         return self._data_loader
 
+    @property
+    def dataset(self) -> torch.utils.data.Dataset:
+        return self._data_loader.dataset
+
     def __iter__(self):
         epoch = 0
         num_items = 0
@@ -620,6 +627,10 @@ class RLDSDataLoader:
         self._sharding = sharding
         self._num_batches = num_batches
 
+    @property
+    def dataset(self) -> DroidRldsDataset:
+        return self._dataset
+
     def __iter__(self):
         epoch = 0
         num_items = 0
@@ -657,6 +668,10 @@ class DataLoaderImpl(DataLoader):
     @property
     def sharding(self) -> jax.sharding.Sharding | None:
         return getattr(self._data_loader, "_sharding", None)
+
+    @property
+    def dataset(self):
+        return getattr(self._data_loader, "dataset", None)
 
 
 # =============================================================================
@@ -716,6 +731,10 @@ class ComposableDataLoaderWrapper:
     def __len__(self) -> int:
         return len(self._composable_loader)
 
+    @property
+    def dataset(self):
+        return getattr(self._composable_loader, "dataset", None)
+
 
 def _build_composable_from_node(
     config: _config.TrainConfig,
@@ -755,7 +774,10 @@ def _build_composable_from_node(
         logging.info(f"{indent}  +-- Dataset: {data_config.repo_id}")
         return loader, data_config
 
-    # node is ComposableDataConfig
+    # node is ComposableDataConfig — extract node-level num_batches if set
+    if node.num_batches is not None:
+        num_batches = node.num_batches
+
     inputs = node.children
     if not inputs:
         raise ValueError("ComposableDataConfig has no children")

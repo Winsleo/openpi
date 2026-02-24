@@ -457,7 +457,7 @@ def main(config: _config.TrainConfig):
         config,
         sharding=data_sharding,
         shuffle=True,
-        num_batches=config.num_train_steps * config.batch_size // jax.device_count(),
+        # num_batches=config.num_train_steps * config.batch_size // jax.device_count(),
     )
     data_iter = iter(data_loader)
     try:
