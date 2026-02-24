@@ -330,6 +330,15 @@ class MultiSourceDataLoader(ComposableDataLoader):
         """Default: sum of all child loader lengths."""
         return sum(len(ld) for ld in self.dataloaders)
 
+    @property
+    def sharding(self):
+        """Return the first non-None sharding found among child loaders."""
+        for ld in self.dataloaders:
+            s = getattr(ld, "sharding", None)
+            if s is not None:
+                return s
+        return None
+
 
 # =============================================================================
 # Single-Loader Wrapper Base Class
@@ -364,6 +373,15 @@ class SingleLoaderWrapper(ComposableDataLoader):
     @property
     def dataset(self):
         return getattr(self._inner, "dataset", None)
+
+    @property
+    def sharding(self):
+        return getattr(self._inner, "sharding", None)
+
+    @property
+    def unwrapped(self):
+        """Unwrap all intermediate wrappers and return the innermost loader."""
+        return getattr(self.inner, "unwrapped", self.inner)
 
 
 # =============================================================================
@@ -882,13 +900,8 @@ class InBatchMixDataLoader(MultiSourceDataLoader):
     ):
         super().__init__(dataloaders, stop_strategy)
         self._random_sample = random_sample
-        self._sharding = next(
-            (getattr(ld, "sharding", None) for ld in self.dataloaders if getattr(ld, "sharding", None) is not None),
-            None,
-        )
-        # Lazy-load apply_sharding only when sharding is actually used
         self._apply_sharding = None
-        if self._sharding is not None:
+        if self.sharding is not None:
             from openpi.training.pytree_utils import apply_sharding
             self._apply_sharding = apply_sharding
 
@@ -966,8 +979,8 @@ class InBatchMixDataLoader(MultiSourceDataLoader):
             combined_data = concat_data(data_parts)
             combined_labels = concat_data(label_parts)
             if self._apply_sharding is not None:
-                combined_data = self._apply_sharding(combined_data, self._sharding)
-                combined_labels = self._apply_sharding(combined_labels, self._sharding)
+                combined_data = self._apply_sharding(combined_data, self.sharding)
+                combined_labels = self._apply_sharding(combined_labels, self.sharding)
 
             self._last_loader_idx = {i: counts[i] for i in range(self._num_loaders)}
             yield combined_data, combined_labels
