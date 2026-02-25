@@ -327,7 +327,13 @@ class MultiSourceDataLoader(ComposableDataLoader):
         return [iter(ld) for ld in self.dataloaders]
 
     def __len__(self) -> int:
-        """Default: sum of all child loader lengths."""
+        """Default length estimate based on stop strategy.
+
+        LONGEST: sum of all child lengths (every loader fully consumed).
+        SHORTEST: min child length × number of loaders (stop when first exhausts).
+        """
+        if self._stop_strategy == SHORTEST:
+            return min(len(ld) for ld in self.dataloaders) * self._num_loaders
         return sum(len(ld) for ld in self.dataloaders)
 
     @property
@@ -481,6 +487,12 @@ class RandomMixDataLoader(MultiSourceDataLoader):
                 if self._stop_strategy == SHORTEST:
                     return
                 active[idx] = False
+
+    def __len__(self) -> int:
+        draws = [len(ld) / w for ld, w in zip(self.dataloaders, self.weights)]
+        if self._stop_strategy == SHORTEST:
+            return int(np.floor(min(draws)))
+        return int(np.ceil(max(draws)))
 
 
 # =============================================================================
@@ -736,32 +748,43 @@ class TaskTaggedDataLoader(MultiSourceDataLoader):
                 active_count -= 1
                 active_list = [self.task_names[i] for i in range(self._num_loaders) if active[i]]
 
+    def __len__(self) -> int:
+        if self.sampling_strategy == 'round_robin':
+            return super().__len__()
+        # 'random' with uniform weights: estimate via len(ld) / (1/N) = len(ld) * N
+        draws = [len(ld) * self._num_loaders for ld in self.dataloaders]
+        if self._stop_strategy == SHORTEST:
+            return min(draws)
+        return max(draws)
+
 
 # =============================================================================
 # Dynamic Schedule DataLoader
 # =============================================================================
 
-class DynamicScheduleDataLoader(MultiSourceDataLoader):
-    """Dynamically adjust sampling weights based on training feedback.
-    
-    This loader enables adaptive sampling strategies where weights are
-    updated during training based on performance metrics like loss.
-    
+class DynamicScheduleDataLoader(RandomMixDataLoader):
+    """Extend :class:`RandomMixDataLoader` with dynamic weight updates.
+
+    Sampling behaviour is identical to ``RandomMixDataLoader``; this subclass
+    adds the ability to adjust weights at runtime based on training feedback
+    (e.g. per-loader loss) and to track per-loader statistics.
+
     Args:
         dataloaders: Sequence of DataLoaders.
         initial_weights: Starting weights. If None, uniform weights.
         enable_tracking: If True, track statistics and allow weight updates.
-    
+        stop_strategy: ``LONGEST`` (default) or ``SHORTEST``.
+
     Attributes:
-        weights: Current sampling weights (numpy array).
+        weights: Current sampling weights (numpy array, inherited).
         last_loader_idx: Index of the loader that produced the last batch.
-    
+
     Examples:
         >>> loader = DynamicScheduleDataLoader(
         ...     [loader_a, loader_b],
         ...     initial_weights=[0.5, 0.5]
         ... )
-        >>> 
+        >>>
         >>> for batch in loader:
         ...     loss = train_step(batch)
         ...     loader.update_weights(loader.last_loader_idx, loss)
@@ -774,28 +797,25 @@ class DynamicScheduleDataLoader(MultiSourceDataLoader):
         enable_tracking: bool = True,
         stop_strategy: str = LONGEST,
     ):
-        super().__init__(dataloaders, stop_strategy)
-        self.weights = _normalize_weights(
-            initial_weights if initial_weights is not None else [1.0] * self._num_loaders
-        )
+        super().__init__(dataloaders, weights=initial_weights, stop_strategy=stop_strategy)
         self.enable_tracking = enable_tracking
         self.loader_performance: dict[int, list] = defaultdict(list)
         self.batches_from_loader = [0] * self._num_loaders
 
     def update_weights(
-        self, 
-        loader_idx: int, 
-        performance: float, 
+        self,
+        loader_idx: int,
+        performance: float,
         learning_rate: float = 0.1,
     ):
         """Update sampling weights based on performance feedback.
-        
-        The current strategy increases weights for loaders with lower
-        performance values (e.g., lower loss = better = higher weight).
-        
+
+        Increases weights for loaders with lower performance values
+        (e.g. lower loss = better = higher weight).
+
         Args:
             loader_idx: Index of the DataLoader.
-            performance: Performance metric (lower is better, e.g., loss).
+            performance: Performance metric (lower is better, e.g. loss).
             learning_rate: Rate of weight adjustment.
         """
         if not self.enable_tracking:
@@ -813,29 +833,16 @@ class DynamicScheduleDataLoader(MultiSourceDataLoader):
             self.weights = (1 - learning_rate) * self.weights + learning_rate * target
 
     def __iter__(self):
-        iterators = self._create_iterators()
-        active = np.ones(self._num_loaders, dtype=bool)
-        buf = np.empty(self._num_loaders, dtype=np.float64)
-
-        while active.any():
-            idx = _weighted_choice(self._num_loaders, self.weights, active, buf)
-            if idx < 0:
-                break
-            try:
-                self._last_loader_idx = idx
-                yield next(iterators[idx])
-                if self.enable_tracking:
-                    self.batches_from_loader[idx] += 1
-            except StopIteration:
-                if self._stop_strategy == SHORTEST:
-                    return
-                active[idx] = False
+        for batch in super().__iter__():
+            if self.enable_tracking:
+                self.batches_from_loader[self._last_loader_idx] += 1
+            yield batch
 
     def get_statistics(self) -> dict:
         """Get usage statistics.
-        
+
         Returns:
-            Dictionary containing batches_per_loader, current_weights,
+            Dictionary with batches_per_loader, current_weights,
             and performance_history.
         """
         return {
