@@ -474,6 +474,23 @@ def create_rlds_data_loader(
     return DataLoaderImpl(data_config, data_loader)
 
 
+def _default_jax_sharding() -> jax.sharding.Sharding:
+    """Create the default data-parallel JAX sharding."""
+    return jax.sharding.NamedSharding(
+        jax.sharding.Mesh(jax.devices(), ("B",)),
+        jax.sharding.PartitionSpec("B"),
+    )
+
+
+def _make_batch_transform(sharding: jax.sharding.Sharding | None):
+    """Return a per-batch transform that applies *sharding* or falls back to tensors."""
+    if sharding is not None:
+        return lambda batch: jax.tree.map(
+            lambda x: jax.make_array_from_process_local_data(sharding, x), batch
+        )
+    return lambda batch: jax.tree.map(torch.as_tensor, batch)
+
+
 class TorchDataLoader:
     """Torch data loader implementation."""
 
@@ -511,14 +528,7 @@ class TorchDataLoader:
         if len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
 
-        # Store sharding - None for PyTorch, JAX sharding for JAX
-        self._sharding = sharding
-        if sharding is None and framework == "jax":
-            # Use data parallel sharding by default for JAX only.
-            self._sharding = jax.sharding.NamedSharding(
-                jax.sharding.Mesh(jax.devices(), ("B",)),
-                jax.sharding.PartitionSpec("B"),
-            )
+        self._sharding = sharding if sharding is not None or framework != "jax" else _default_jax_sharding()
         self._num_batches = num_batches
 
         mp_context = None
@@ -553,22 +563,14 @@ class TorchDataLoader:
     def sharding(self) -> jax.sharding.Sharding | None:
         return self._sharding
 
+    @property
+    def num_batches(self) -> int | None:
+        return self._num_batches
+
     def __iter__(self):
-        if self._sharding is not None:
-            transform = lambda batch: jax.tree.map(
-                lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch
-            )
-        else:
-            transform = lambda batch: jax.tree.map(torch.as_tensor, batch)
-        yield from _batched_iter(self._data_loader, self._num_batches, transform)
+        yield from _batched_iter(self._data_loader, self._num_batches, _make_batch_transform(self._sharding))
 
     def __len__(self) -> int:
-        """Return the number of batches.
-
-        Returns:
-            If num_batches was specified, returns that value.
-            Otherwise, returns the number of batches in one epoch.
-        """
         if self._num_batches is not None:
             return self._num_batches
         return len(self._data_loader)
@@ -628,20 +630,11 @@ class RLDSDataLoader:
         sharding: jax.sharding.Sharding | None = None,
         num_batches: int | None = None,
     ):
-        self._dataset = dataset
-        self._num_batches = num_batches
-
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
-        if sharding is None:
-            # Use data parallel sharding by default.
-            sharding = jax.sharding.NamedSharding(
-                jax.sharding.Mesh(jax.devices(), ("B",)),
-                jax.sharding.PartitionSpec("B"),
-            )
-
-        self._sharding = sharding
+        self._dataset = dataset
+        self._sharding = sharding if sharding is not None else _default_jax_sharding()
         self._num_batches = num_batches
 
     @property
@@ -652,11 +645,17 @@ class RLDSDataLoader:
     def sharding(self) -> jax.sharding.Sharding | None:
         return self._sharding
 
+    @property
+    def num_batches(self) -> int | None:
+        return self._num_batches
+
     def __iter__(self):
-        transform = lambda batch: jax.tree.map(
-            lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch
-        )
-        yield from _batched_iter(self._dataset, self._num_batches, transform)
+        yield from _batched_iter(self._dataset, self._num_batches, _make_batch_transform(self._sharding))
+
+    def __len__(self) -> int:
+        if self._num_batches is not None:
+            return self._num_batches
+        return len(self._dataset)
 
 
 class BaseDataLoaderAdapter:
