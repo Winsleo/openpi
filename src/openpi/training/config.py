@@ -907,7 +907,7 @@ _CONFIGS = [
                             ),
                             base_config=DataConfig(
                                 prompt_from_task=True,
-                                num_batches=100,
+                                num_batches=6,
                                 episodes_index=list(range(100)),
                                 behavior_dataset_root="/data/behavior-1k-dataset",
                             ),
@@ -920,14 +920,14 @@ _CONFIGS = [
                             ),
                             base_config=DataConfig(
                                 prompt_from_task=True,
-                                num_batches=90,
+                                num_batches=4,
                                 episodes_index=list(range(100, 190)),
                                 behavior_dataset_root="/data/behavior-1k-dataset",
                             ),
                         ),
                     ],
                     refresh_every=1,
-                    num_epochs=1,
+                    num_epochs=2,
                 ),
                 LeRobotB1KDataConfig(
                     repo_id="behavior-1k/2025-challenge-demos",
@@ -937,7 +937,7 @@ _CONFIGS = [
                     ),
                     base_config=DataConfig(
                         prompt_from_task=True,
-                        num_batches=50,
+                        num_batches=5,
                         episodes_index=list(range(50)),  # Another subset
                         behavior_dataset_root="/data/behavior-1k-dataset",
                     ),
@@ -946,7 +946,7 @@ _CONFIGS = [
             return_source=True,
             seed=42,
             refresh_every=1,
-            num_epochs=1,
+            num_epochs=2,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/model/pi05_base/params"),
         num_train_steps=50000,
