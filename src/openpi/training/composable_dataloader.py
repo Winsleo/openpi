@@ -1143,6 +1143,17 @@ class SourceTaggedDataLoader(SingleLoaderWrapper):
         return len(self._inner)
 
 
+def get_loader_ident(loader) -> str:
+    """Derive a short identifier from loader attributes (source_names, task_names, data_config, etc.)."""
+    names = getattr(loader, 'source_names', None) or getattr(loader, 'task_names', None)
+    if names:
+        return ",".join(str(n) for n in names)
+    cfg = getattr(loader, 'data_config', None)
+    if cfg is not None and getattr(cfg, 'repo_id', None):
+        return str(cfg.repo_id)
+    return f"{type(loader).__name__}#{id(loader) & 0xFFFF:04x}"
+
+
 # =============================================================================
 # Refreshable DataLoader Wrapper
 # =============================================================================
@@ -1218,7 +1229,8 @@ class RefreshableDataLoader(SingleLoaderWrapper):
         super().__init__(dataloader)
         if on_refresh is None:
             def default_refresh(epoch: int, wrapper) -> None:
-                logging.info(f"Epoch {epoch} done, refreshing...")
+                ident = get_loader_ident(wrapper._inner)
+                logging.info(f"Epoch {epoch} done, refreshing [{ident}]...")
             self._on_refresh = default_refresh
         else:
             self._on_refresh = on_refresh
