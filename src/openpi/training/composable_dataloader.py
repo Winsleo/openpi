@@ -1227,13 +1227,7 @@ class RefreshableDataLoader(SingleLoaderWrapper):
         num_epochs: Optional[int] = None,
     ):
         super().__init__(dataloader)
-        if on_refresh is None:
-            def default_refresh(epoch: int, wrapper) -> None:
-                ident = get_loader_ident(wrapper._inner)
-                logging.info(f"Epoch {epoch} done, refreshing [{ident}]...")
-            self._on_refresh = default_refresh
-        else:
-            self._on_refresh = on_refresh
+        self._on_refresh = on_refresh
         self._num_epochs = num_epochs
         if refresh_every < 1:
             raise ValueError(f"refresh_every must be >= 1, got {refresh_every}")
@@ -1248,9 +1242,11 @@ class RefreshableDataLoader(SingleLoaderWrapper):
                 yield batch
             has_next = self._num_epochs is None or (ep + 1) < self._num_epochs
             if has_next and (ep + 1) % self._refresh_every == 0:
-                result = self._on_refresh(ep, self)
-                if result is not None:
-                    self._inner = result
+                RefreshableDataLoader.default_refresh(ep, self)
+                if self._on_refresh is not None:
+                    result = self._on_refresh(ep, self)
+                    if result is not None:
+                        self._inner = result
 
     def __len__(self):
         if self._num_epochs is None:
@@ -1259,6 +1255,11 @@ class RefreshableDataLoader(SingleLoaderWrapper):
                 "Set num_epochs to a finite value to use len()."
             )
         return self._num_epochs * len(self._inner)
+
+    @staticmethod
+    def default_refresh(epoch: int, wrapper) -> None:
+        ident = get_loader_ident(wrapper._inner)
+        logging.info(f"[{ident}] Epoch {epoch + 1} complete, refreshing for next epoch")
 
 
 # =============================================================================
