@@ -1246,7 +1246,8 @@ class RefreshableDataLoader(SingleLoaderWrapper):
             self.epoch = ep
             for batch in self._inner:
                 yield batch
-            if (ep + 1) % self._refresh_every == 0:
+            has_next = self._num_epochs is None or (ep + 1) < self._num_epochs
+            if has_next and (ep + 1) % self._refresh_every == 0:
                 result = self._on_refresh(ep, self)
                 if result is not None:
                     self._inner = result
