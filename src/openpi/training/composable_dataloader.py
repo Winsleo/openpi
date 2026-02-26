@@ -1143,15 +1143,113 @@ class SourceTaggedDataLoader(SingleLoaderWrapper):
         return len(self._inner)
 
 
-def get_loader_ident(loader) -> str:
-    """Derive a short identifier from loader attributes (source_names, task_names, data_config, etc.)."""
-    names = getattr(loader, 'source_names', None) or getattr(loader, 'task_names', None)
+def _get_leaf_repo(loader: Any) -> Optional[str]:
+    """Extract repo_id from a loader (handles data_config as attr or method)."""
+    cfg_attr = getattr(loader, "data_config", None)
+    if cfg_attr is None:
+        return None
+    try:
+        cfg = cfg_attr() if callable(cfg_attr) else cfg_attr
+    except Exception:
+        return None
+    return getattr(cfg, "repo_id", None) if cfg is not None else None
+
+
+def _get_dataset_hint(loader: Any) -> Optional[str]:
+    """Extract dataset identifier from loader's dataset attribute."""
+    dataset = getattr(loader, "dataset", None)
+    if dataset is None:
+        return None
+    hint = (
+        getattr(dataset, "repo_id", None)
+        or getattr(dataset, "dataset_id", None)
+        or getattr(dataset, "name", None)
+    )
+    if hint is None and hasattr(dataset, "info"):
+        info = getattr(dataset, "info", None)
+        if hasattr(info, "get"):
+            hint = info.get("dataset_id") or info.get("repo_id") or info.get("name")
+    return str(hint) if hint is not None else None
+
+
+def _get_children(loader: Any) -> list[Any]:
+    """Return child loaders for tree traversal: .inner (single) or .dataloaders (multi)."""
+    inner = getattr(loader, "inner", None)
+    if inner is not None:
+        return [inner]
+    dataloaders = getattr(loader, "dataloaders", None)
+    if dataloaders is not None:
+        return list(dataloaders)
+    return []
+
+
+def _build_chain_and_datasets(
+    loader: Any,
+    seen: set[int],
+    *,
+    max_depth: int = 14,
+) -> tuple[list[str], set[str], list[str], list[str]]:
+    """Recursively build class chain (one path per branch) and collect repos, names, dataset hints."""
+    if max_depth <= 0 or id(loader) in seen:
+        return [], set(), [], []
+    seen.add(id(loader))
+    cls_name = type(loader).__name__
+    repos: set[str] = set()
+    names: list[str] = []
+    dataset_hints: list[str] = []
+
+    repo = _get_leaf_repo(loader)
+    if repo:
+        repos.add(str(repo))
+
+    ds_hint = _get_dataset_hint(loader)
+    if ds_hint:
+        dataset_hints.append(ds_hint)
+
+    for n in getattr(loader, "source_names", None) or getattr(loader, "task_names", None) or []:
+        names.append(str(n))
+
+    children = _get_children(loader)
+    if not children:
+        return [cls_name], repos, names, dataset_hints
+
+    n = len(children)
+    suffix = f"({n})" if n > 1 else ""
+    branches: list[str] = []
+    for i, c in enumerate(children):
+        sub_lines, sub_repos, sub_names, sub_ds = _build_chain_and_datasets(c, seen, max_depth=max_depth - 1)
+        repos.update(sub_repos)
+        names.extend(sub_names)
+        dataset_hints.extend(sub_ds)
+        sub_path = "→".join(sub_lines) if sub_lines else "?"
+        branch = f"{cls_name}{suffix}→{sub_path}"
+        prefix = "  └ " if i == n - 1 else "  ├ "
+        branches.append(prefix + branch)
+    return branches, repos, names, dataset_hints
+
+
+def get_loader_ident(loader: Any) -> str:
+    """Build a combined identifier: dataloader class chain + dataset content.
+
+    Output can span multiple lines. Format:
+      chain: <multi-line tree of class names>
+      datasets: <repo_ids, source names, dataset hints>
+    """
+    seen: set[int] = set()
+    chain_lines, repos, names, dataset_hints = _build_chain_and_datasets(loader, seen)
+
+    chain_str = "\n  ".join(chain_lines) if chain_lines else type(loader).__name__
+
+    dataset_parts: list[str] = []
+    all_repos = repos | set(dataset_hints)
+    if all_repos:
+        dataset_parts.append("repo=" + ",".join(sorted(all_repos)))
     if names:
-        return ",".join(str(n) for n in names)
-    cfg = getattr(loader, 'data_config', None)
-    if cfg is not None and getattr(cfg, 'repo_id', None):
-        return str(cfg.repo_id)
-    return f"{type(loader).__name__}#{id(loader) & 0xFFFF:04x}"
+        unique_names = list(dict.fromkeys(names))
+        dataset_parts.append("sources=" + ",".join(unique_names))
+    dataset_str = " | ".join(dataset_parts) if dataset_parts else "(no dataset info)"
+
+    return f"chain:\n  {chain_str}\ndatasets:\n  {dataset_str}"
 
 
 # =============================================================================
@@ -1180,21 +1278,29 @@ class RefreshableDataLoader(SingleLoaderWrapper):
     3. **Return a new loader**: the return value, if not ``None``, replaces
        the inner loader automatically.
 
+    Note:
+        The refresh callback is **not** invoked after the final epoch
+        (there is no subsequent epoch to prepare for). This means the
+        actual number of refresh calls is
+        ``floor((num_epochs - 1) / refresh_every)`` for finite runs.
+
     Args:
         dataloader: The DataLoader to wrap.
         on_refresh: Callback ``(epoch, wrapper) -> Optional[AnyDataLoader]``.
-            If it returns a DataLoader, the inner loader is replaced;
-            otherwise only in-place / property mutations take effect.
+            *epoch* is 1-based. If the callback returns a DataLoader, the
+            inner loader is replaced; otherwise only in-place / property
+            mutations take effect.
         refresh_every: Invoke ``on_refresh`` every this many epochs.
             Defaults to 1 (refresh after every epoch). For example, if
-            ``refresh_every=3``, the callback fires after epochs 2, 5, 8, …
-            (i.e. after every 3rd completed epoch, 0-indexed).
+            ``refresh_every=3``, the callback fires after epochs 3, 6, 9, …
+            (1-indexed) — provided a subsequent epoch exists.
         num_epochs: Number of epochs to iterate. If ``None``, iterate
             indefinitely (never stops). If set, the inner loader will be
             re-iterated ``num_epochs`` times.
 
     Attributes:
-        epoch: Current epoch index (0-based), incremented each epoch.
+        epoch: Current epoch number (1-based), updated at the start of
+            each epoch. 0 before iteration begins.
 
     Examples:
         >>> # 1. In-place mutation
@@ -1205,7 +1311,9 @@ class RefreshableDataLoader(SingleLoaderWrapper):
         >>> def swap_loader(epoch, wrapper):
         ...     wrapper.inner = build_new_loader(epoch)
         >>>
-        >>> # 3. Return value replacement
+        >>> # 3. Return value replacement (refresh_every=3, num_epochs=10)
+        >>> #    Refreshes fire after epochs 3, 6, 9 (3 times).
+        >>> #    Epoch 10 is the last — no refresh afterwards.
         >>> def rotate_shard(epoch, wrapper):
         ...     return build_loader_for_shard(epoch % num_shards)
         >>>
@@ -1213,7 +1321,7 @@ class RefreshableDataLoader(SingleLoaderWrapper):
         ...     train_loader,
         ...     on_refresh=rotate_shard,
         ...     refresh_every=3,
-        ...     num_epochs=9,
+        ...     num_epochs=10,
         ... )
         >>> for batch in loader:
         ...     train_step(batch)
@@ -1235,18 +1343,19 @@ class RefreshableDataLoader(SingleLoaderWrapper):
         self.epoch: int = 0
 
     def __iter__(self):
-        epoch_iter = range(self._num_epochs) if self._num_epochs is not None else itertools.count()
+        epoch_iter = range(1, self._num_epochs + 1) if self._num_epochs is not None else itertools.count(1)
         for ep in epoch_iter:
             self.epoch = ep
             for batch in self._inner:
                 yield batch
-            has_next = self._num_epochs is None or (ep + 1) < self._num_epochs
-            if has_next and (ep + 1) % self._refresh_every == 0:
+            has_next = self._num_epochs is None or ep < self._num_epochs
+            if has_next and ep % self._refresh_every == 0:
                 RefreshableDataLoader.default_refresh(ep, self)
                 if self._on_refresh is not None:
                     result = self._on_refresh(ep, self)
                     if result is not None:
                         self._inner = result
+        RefreshableDataLoader.default_refresh(self._num_epochs, self)
 
     def __len__(self):
         if self._num_epochs is None:
@@ -1258,8 +1367,12 @@ class RefreshableDataLoader(SingleLoaderWrapper):
 
     @staticmethod
     def default_refresh(epoch: int, wrapper) -> None:
-        ident = get_loader_ident(wrapper._inner)
-        logging.info(f"[{ident}] Epoch {epoch + 1} complete, refreshing for next epoch")
+        ident = get_loader_ident(wrapper)
+        total = wrapper._num_epochs
+        if total is not None:
+            logging.info("Epoch %s/%s complete\n%s", epoch, total, ident)
+        else:
+            logging.info("Epoch %s complete\n%s", epoch, ident)
 
 
 # =============================================================================
