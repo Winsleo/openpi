@@ -35,6 +35,7 @@ from typing import Any, Optional, Protocol, TypeVar, Union, runtime_checkable
 import numpy as np
 import torch
 from torch.utils.data import DataLoader as TorchDataLoader, Dataset as TorchDataset
+from openpi.training.loader_ident import get_loader_ident
 from openpi.training.pytree_utils import slice_data, concat_data
 
 
@@ -1143,115 +1144,6 @@ class SourceTaggedDataLoader(SingleLoaderWrapper):
         return len(self._inner)
 
 
-def _get_leaf_repo(loader: Any) -> Optional[str]:
-    """Extract repo_id from a loader (handles data_config as attr or method)."""
-    cfg_attr = getattr(loader, "data_config", None)
-    if cfg_attr is None:
-        return None
-    try:
-        cfg = cfg_attr() if callable(cfg_attr) else cfg_attr
-    except Exception:
-        return None
-    return getattr(cfg, "repo_id", None) if cfg is not None else None
-
-
-def _get_dataset_hint(loader: Any) -> Optional[str]:
-    """Extract dataset identifier from loader's dataset attribute."""
-    dataset = getattr(loader, "dataset", None)
-    if dataset is None:
-        return None
-    hint = (
-        getattr(dataset, "repo_id", None)
-        or getattr(dataset, "dataset_id", None)
-        or getattr(dataset, "name", None)
-    )
-    if hint is None and hasattr(dataset, "info"):
-        info = getattr(dataset, "info", None)
-        if hasattr(info, "get"):
-            hint = info.get("dataset_id") or info.get("repo_id") or info.get("name")
-    return str(hint) if hint is not None else None
-
-
-def _get_children(loader: Any) -> list[Any]:
-    """Return child loaders for tree traversal: .inner (single) or .dataloaders (multi)."""
-    inner = getattr(loader, "inner", None)
-    if inner is not None:
-        return [inner]
-    dataloaders = getattr(loader, "dataloaders", None)
-    if dataloaders is not None:
-        return list(dataloaders)
-    return []
-
-
-def _build_chain_and_datasets(
-    loader: Any,
-    seen: set[int],
-    *,
-    max_depth: int = 14,
-) -> tuple[list[str], set[str], list[str], list[str]]:
-    """Recursively build class chain (one path per branch) and collect repos, names, dataset hints."""
-    if max_depth <= 0 or id(loader) in seen:
-        return [], set(), [], []
-    seen.add(id(loader))
-    cls_name = type(loader).__name__
-    repos: set[str] = set()
-    names: list[str] = []
-    dataset_hints: list[str] = []
-
-    repo = _get_leaf_repo(loader)
-    if repo:
-        repos.add(str(repo))
-
-    ds_hint = _get_dataset_hint(loader)
-    if ds_hint:
-        dataset_hints.append(ds_hint)
-
-    for n in getattr(loader, "source_names", None) or getattr(loader, "task_names", None) or []:
-        names.append(str(n))
-
-    children = _get_children(loader)
-    if not children:
-        return [cls_name], repos, names, dataset_hints
-
-    n = len(children)
-    suffix = f"({n})" if n > 1 else ""
-    branches: list[str] = []
-    for i, c in enumerate(children):
-        sub_lines, sub_repos, sub_names, sub_ds = _build_chain_and_datasets(c, seen, max_depth=max_depth - 1)
-        repos.update(sub_repos)
-        names.extend(sub_names)
-        dataset_hints.extend(sub_ds)
-        sub_path = "→".join(sub_lines) if sub_lines else "?"
-        branch = f"{cls_name}{suffix}→{sub_path}"
-        prefix = "  └ " if i == n - 1 else "  ├ "
-        branches.append(prefix + branch)
-    return branches, repos, names, dataset_hints
-
-
-def get_loader_ident(loader: Any) -> str:
-    """Build a combined identifier: dataloader class chain + dataset content.
-
-    Output can span multiple lines. Format:
-      chain: <multi-line tree of class names>
-      datasets: <repo_ids, source names, dataset hints>
-    """
-    seen: set[int] = set()
-    chain_lines, repos, names, dataset_hints = _build_chain_and_datasets(loader, seen)
-
-    chain_str = "\n  ".join(chain_lines) if chain_lines else type(loader).__name__
-
-    dataset_parts: list[str] = []
-    all_repos = repos | set(dataset_hints)
-    if all_repos:
-        dataset_parts.append("repo=" + ",".join(sorted(all_repos)))
-    if names:
-        unique_names = list(dict.fromkeys(names))
-        dataset_parts.append("sources=" + ",".join(unique_names))
-    dataset_str = " | ".join(dataset_parts) if dataset_parts else "(no dataset info)"
-
-    return f"chain:\n  {chain_str}\ndatasets:\n  {dataset_str}"
-
-
 # =============================================================================
 # Refreshable DataLoader Wrapper
 # =============================================================================
@@ -1370,9 +1262,9 @@ class RefreshableDataLoader(SingleLoaderWrapper):
         ident = get_loader_ident(wrapper)
         total = wrapper._num_epochs
         if total is not None:
-            logging.info("Epoch %s/%s complete\n%s", epoch, total, ident)
+            logging.info("Epoch %s/%s complete\nLoader tree:\n%s", epoch, total, ident)
         else:
-            logging.info("Epoch %s complete\n%s", epoch, ident)
+            logging.info("Epoch %s complete\nLoader tree:\n%s", epoch, ident)
 
 
 # =============================================================================
