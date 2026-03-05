@@ -950,6 +950,36 @@ class InBatchMixDataLoader(MultiSourceDataLoader):
             indices = np.arange(num_samples)
         return slice_data(data, indices), slice_data(labels, indices), num_samples
 
+    def _process_batch(self, idx: int, batch, data_parts, label_parts, counts):
+        """Extract, validate, slice and store one loader's batch."""
+        extracted = self._extract_batch(batch)
+        if extracted is None:
+            raise ValueError(
+                f"InBatchMixDataLoader: loader {idx} yielded an incompatible "
+                f"batch format (expected a (data, labels) tuple, got "
+                f"{type(batch).__name__}). All child loaders must yield "
+                f"(data, labels) or (tag, (data, labels)) tuples."
+            )
+        data_parts[idx], label_parts[idx], counts[idx] = (
+            self._slice_batch(*extracted, self.samples_per_loader[idx])
+        )
+
+    def _fetch_serial(self, iterators, is_longest, data_parts, label_parts, counts):
+        """Fetch from all loaders sequentially. Returns False if should stop."""
+        for idx in range(self._num_loaders):
+            try:
+                batch = next(iterators[idx])
+            except StopIteration:
+                if not is_longest:
+                    return False
+                iterators[idx] = iter(self.dataloaders[idx])
+                try:
+                    batch = next(iterators[idx])
+                except StopIteration:
+                    return False
+            self._process_batch(idx, batch, data_parts, label_parts, counts)
+        return True
+
     def __iter__(self):
         iterators = self._create_iterators()
         data_parts: list = [None] * self._num_loaders
@@ -960,29 +990,9 @@ class InBatchMixDataLoader(MultiSourceDataLoader):
         iters_done = 0
 
         while iters_done < max_iters:
-            for idx in range(self._num_loaders):
-                try:
-                    batch = next(iterators[idx])
-                except StopIteration:
-                    if not is_longest:
-                        return  # SHORTEST: stop immediately
-                    # LONGEST: restart exhausted loader
-                    iterators[idx] = iter(self.dataloaders[idx])
-                    try:
-                        batch = next(iterators[idx])
-                    except StopIteration:
-                        return  # Empty even after restart
-                extracted = self._extract_batch(batch)
-                if extracted is None:
-                    raise ValueError(
-                        f"InBatchMixDataLoader: loader {idx} yielded an incompatible "
-                        f"batch format (expected a (data, labels) tuple, got "
-                        f"{type(batch).__name__}). All child loaders must yield "
-                        f"(data, labels) or (tag, (data, labels)) tuples."
-                    )
-                data_parts[idx], label_parts[idx], counts[idx] = (
-                    self._slice_batch(*extracted, self.samples_per_loader[idx])
-                )
+            ok = self._fetch_serial(iterators, is_longest, data_parts, label_parts, counts)
+            if not ok:
+                return
 
             combined_data = concat_data(data_parts)
             combined_labels = concat_data(label_parts)
