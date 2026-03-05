@@ -30,6 +30,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 import itertools
+from concurrent.futures import ThreadPoolExecutor, wait
 import logging
 from typing import Any, Optional, Protocol, TypeVar, Union, runtime_checkable
 import numpy as np
@@ -857,6 +858,18 @@ class DynamicScheduleDataLoader(RandomMixDataLoader):
 # In-Batch Mix DataLoader
 # =============================================================================
 
+_FETCH_STOPPED = object()
+"""Sentinel returned by _fetch_one when iterator raises StopIteration."""
+
+
+def _fetch_one(iterator):
+    """Fetch one batch from *iterator*, returning the batch or ``_FETCH_STOPPED``."""
+    try:
+        return next(iterator)
+    except StopIteration:
+        return _FETCH_STOPPED
+
+
 def _get_batch_size(data) -> int:
     """Get batch size from data (typically actions/labels which are always arrays)."""
     if hasattr(data, 'shape'):
@@ -883,6 +896,9 @@ class InBatchMixDataLoader(MultiSourceDataLoader):
         stop_strategy: ``SHORTEST`` (default) — stop when any loader exhausts.
             ``LONGEST`` — restart exhausted loaders so every loader is fully
             consumed; total iterations = ``max(len(ld))``.
+        parallel_fetch: If True (default), fetch from all sub-loaders in parallel
+            using threads. Set False for backward compatibility or if sub-loaders
+            are not thread-safe.
     
     After each yielded batch, ``last_loader_idx`` is set to a dict
     ``{child_index: actual_sample_count}`` describing the composition,
@@ -905,9 +921,11 @@ class InBatchMixDataLoader(MultiSourceDataLoader):
         total_batch_size: Optional[int] = None,
         random_sample: bool = False,
         stop_strategy: str = SHORTEST,
+        parallel_fetch: bool = True,
     ):
         super().__init__(dataloaders, stop_strategy)
         self._random_sample = random_sample
+        self._parallel_fetch = parallel_fetch
         self._apply_sharding = None
         if self.sharding is not None:
             from openpi.training.pytree_utils import apply_sharding
@@ -950,6 +968,70 @@ class InBatchMixDataLoader(MultiSourceDataLoader):
             indices = np.arange(num_samples)
         return slice_data(data, indices), slice_data(labels, indices), num_samples
 
+    def _process_batch(self, idx: int, batch, data_parts, label_parts, counts):
+        """Extract, validate, slice and store one loader's batch."""
+        extracted = self._extract_batch(batch)
+        if extracted is None:
+            raise ValueError(
+                f"InBatchMixDataLoader: loader {idx} yielded an incompatible "
+                f"batch format (expected a (data, labels) tuple, got "
+                f"{type(batch).__name__}). All child loaders must yield "
+                f"(data, labels) or (tag, (data, labels)) tuples."
+            )
+        data_parts[idx], label_parts[idx], counts[idx] = (
+            self._slice_batch(*extracted, self.samples_per_loader[idx])
+        )
+
+    def _fetch_serial(self, iterators, is_longest, data_parts, label_parts, counts):
+        """Fetch from all loaders sequentially. Returns False if should stop."""
+        for idx in range(self._num_loaders):
+            try:
+                batch = next(iterators[idx])
+            except StopIteration:
+                if not is_longest:
+                    return False
+                iterators[idx] = iter(self.dataloaders[idx])
+                try:
+                    batch = next(iterators[idx])
+                except StopIteration:
+                    return False
+            self._process_batch(idx, batch, data_parts, label_parts, counts)
+        return True
+
+    def _fetch_parallel(self, executor, iterators, is_longest, data_parts, label_parts, counts):
+        """Fetch from all loaders via *executor* in parallel. Returns False if should stop."""
+        future_to_idx = {
+            executor.submit(_fetch_one, iterators[idx]): idx
+            for idx in range(self._num_loaders)
+        }
+        wait(future_to_idx)
+
+        to_restart: list[int] = []
+        for future, idx in future_to_idx.items():
+            result = future.result()
+            if result is _FETCH_STOPPED:
+                if not is_longest:
+                    return False
+                to_restart.append(idx)
+            else:
+                self._process_batch(idx, result, data_parts, label_parts, counts)
+
+        if to_restart:
+            for idx in to_restart:
+                iterators[idx] = iter(self.dataloaders[idx])
+            retry_futures = {
+                executor.submit(_fetch_one, iterators[idx]): idx
+                for idx in to_restart
+            }
+            wait(retry_futures)
+            for future, idx in retry_futures.items():
+                result = future.result()
+                if result is _FETCH_STOPPED:
+                    return False
+                self._process_batch(idx, result, data_parts, label_parts, counts)
+
+        return True
+
     def __iter__(self):
         iterators = self._create_iterators()
         data_parts: list = [None] * self._num_loaders
@@ -958,41 +1040,30 @@ class InBatchMixDataLoader(MultiSourceDataLoader):
         is_longest = self._stop_strategy == LONGEST
         max_iters = max(len(ld) for ld in self.dataloaders) if is_longest else float('inf')
         iters_done = 0
+        use_parallel = self._parallel_fetch and self._num_loaders > 1
 
-        while iters_done < max_iters:
-            for idx in range(self._num_loaders):
-                try:
-                    batch = next(iterators[idx])
-                except StopIteration:
-                    if not is_longest:
-                        return  # SHORTEST: stop immediately
-                    # LONGEST: restart exhausted loader
-                    iterators[idx] = iter(self.dataloaders[idx])
-                    try:
-                        batch = next(iterators[idx])
-                    except StopIteration:
-                        return  # Empty even after restart
-                extracted = self._extract_batch(batch)
-                if extracted is None:
-                    raise ValueError(
-                        f"InBatchMixDataLoader: loader {idx} yielded an incompatible "
-                        f"batch format (expected a (data, labels) tuple, got "
-                        f"{type(batch).__name__}). All child loaders must yield "
-                        f"(data, labels) or (tag, (data, labels)) tuples."
-                    )
-                data_parts[idx], label_parts[idx], counts[idx] = (
-                    self._slice_batch(*extracted, self.samples_per_loader[idx])
-                )
+        executor = ThreadPoolExecutor(max_workers=self._num_loaders) if use_parallel else None
+        try:
+            while iters_done < max_iters:
+                if executor is not None:
+                    ok = self._fetch_parallel(executor, iterators, is_longest, data_parts, label_parts, counts)
+                else:
+                    ok = self._fetch_serial(iterators, is_longest, data_parts, label_parts, counts)
+                if not ok:
+                    return
 
-            combined_data = concat_data(data_parts)
-            combined_labels = concat_data(label_parts)
-            if self._apply_sharding is not None:
-                combined_data = self._apply_sharding(combined_data, self.sharding)
-                combined_labels = self._apply_sharding(combined_labels, self.sharding)
+                combined_data = concat_data(data_parts)
+                combined_labels = concat_data(label_parts)
+                if self._apply_sharding is not None:
+                    combined_data = self._apply_sharding(combined_data, self.sharding)
+                    combined_labels = self._apply_sharding(combined_labels, self.sharding)
 
-            self._last_loader_idx = {i: counts[i] for i in range(self._num_loaders)}
-            yield combined_data, combined_labels
-            iters_done += 1
+                self._last_loader_idx = {i: counts[i] for i in range(self._num_loaders)}
+                yield combined_data, combined_labels
+                iters_done += 1
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=False)
 
     def __len__(self):
         if self._stop_strategy == LONGEST:
@@ -1369,11 +1440,13 @@ class Compose:
         samples_per_loader: Optional[Sequence[int]] = None,
         random_sample: bool = False,
         stop_strategy: str = SHORTEST,
+        parallel_fetch: bool = True,
     ) -> InBatchMixDataLoader:
         """Create an in-batch mixing DataLoader."""
         return InBatchMixDataLoader(
             list(loaders), samples_per_loader,
             random_sample=random_sample, stop_strategy=stop_strategy,
+            parallel_fetch=parallel_fetch,
         )
 
     @staticmethod

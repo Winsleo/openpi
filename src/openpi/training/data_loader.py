@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import dataclasses
 import logging
 import multiprocessing
 import os
@@ -790,12 +791,25 @@ def _build_composable_from_node(
     if not inputs:
         raise ValueError("ComposableDataConfig has no children")
 
+    strategy = node.composition_strategy
+    weights = node.weights
+    if strategy == "inbatch":
+        samples_per_loader = _compute_samples_per_loader(
+            weights, len(inputs), config.batch_size
+        )
+    else:
+        samples_per_loader = None
+
     child_loaders: list[composable.BaseDataLoader] = []
     primary_data_config: _config.DataConfig | None = None
 
     for i, child in enumerate(inputs):
+        if strategy == "inbatch":
+            child_config = dataclasses.replace(config, batch_size=samples_per_loader[i])
+        else:
+            child_config = config
         sub_loader, sub_data_config = _build_composable_from_node(
-            config,
+            child_config,
             child,
             sharding=sharding,
             shuffle=shuffle,
@@ -809,8 +823,6 @@ def _build_composable_from_node(
         if primary_data_config is None:
             primary_data_config = sub_data_config
 
-    strategy = node.composition_strategy
-    weights = node.weights
     pattern = node.pattern
     task_names = node.task_names
     stop_strategy = node.stop_strategy
@@ -834,7 +846,6 @@ def _build_composable_from_node(
     elif strategy == "dynamic":
         composed = composable.Compose.dynamic(*child_loaders, initial_weights=weights, stop_strategy=stop_strategy)
     elif strategy == "inbatch":
-        samples_per_loader = _compute_samples_per_loader(weights, num_loaders, config.batch_size)
         logging.info(
             f"inbatch: num_loaders={num_loaders}, batch_size={config.batch_size}, "
             f"samples_per_loader={samples_per_loader}"
@@ -844,6 +855,7 @@ def _build_composable_from_node(
             samples_per_loader=samples_per_loader,
             random_sample=node.inbatch_random_sample,
             stop_strategy=stop_strategy,
+            parallel_fetch=node.inbatch_parallel_fetch,
         )
     else:
         raise ValueError(f"Unknown composition strategy: {strategy}")

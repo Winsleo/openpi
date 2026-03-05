@@ -590,6 +590,10 @@ class ComposableDataConfig:
     # If True, randomly selects samples; if False, takes first N samples
     inbatch_random_sample: bool = False
 
+    # Whether to fetch from sub-loaders in parallel (for inbatch strategy)
+    # If True (default), uses ThreadPoolExecutor to overlap I/O. Set False for compatibility.
+    inbatch_parallel_fetch: bool = True
+
     # Stop strategy for multi-source loaders: LONGEST (default) or SHORTEST.
     # LONGEST: iterate until all loaders are fully consumed (shorter ones restart).
     # SHORTEST: stop as soon as any loader exhausts.
