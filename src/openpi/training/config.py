@@ -10,6 +10,7 @@ import pathlib
 from typing import Any, Literal, Protocol, TypeAlias, Union
 
 import etils.epath as epath
+import jax
 import flax.nnx as nnx
 from typing_extensions import override
 import tyro
@@ -677,8 +678,11 @@ class TrainConfig:
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
-    # Global batch size.
+    # Global batch size. If batch_size_per_gpu is set, batch_size is ignored and
+    # effective batch_size = batch_size_per_gpu * num_devices (resolved at train start).
     batch_size: int = 32
+    batch_size_per_gpu: int | None = None
+    
     # Number of gradient accumulation steps. Effective batch size = batch_size * gradient_accumulation_steps.
     # This allows training with larger effective batch sizes on low-memory devices.
     gradient_accumulation_steps: int = 1
@@ -892,7 +896,7 @@ _CONFIGS = [
         project_name="B1K",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=50, paligemma_variant="gemma_2b"),
         composable_data=ComposableDataConfig(
-            composition_strategy="proportional",
+            composition_strategy="inbatch",
             weights=[2, 1],
             children=[
                 ComposableDataConfig(
@@ -950,6 +954,7 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/model/pi05_base/params"),
         num_train_steps=50000,
+        batch_size_per_gpu=32,
         freeze_filter=pi0_config.Pi0Config(
             pi05=True, action_horizon=50, paligemma_variant="gemma_2b", freeze_components=["llm_base"]
         ).get_freeze_filter(),
@@ -1297,8 +1302,15 @@ _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
 
 
 def cli() -> TrainConfig:
-    return tyro.extras.overridable_config_cli({k: (k, v) for k, v in _CONFIGS_DICT.items()})
-
+    config = tyro.extras.overridable_config_cli(
+        {k: (k, v) for k, v in _CONFIGS_DICT.items()}
+    )
+    if config.batch_size_per_gpu is not None:
+        config = dataclasses.replace(
+            config,
+            batch_size=config.batch_size_per_gpu * jax.device_count(),
+        )
+    return config
 
 def get_config(config_name: str) -> TrainConfig:
     """Get a config by name."""
