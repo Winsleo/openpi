@@ -47,6 +47,18 @@ from openpi.training.pytree_utils import slice_data, concat_data
 # Module-level random number generator using NumPy's modern Generator API
 _rng: np.random.Generator = np.random.default_rng()
 
+# Lazy import of jax (only when InBatchMix needs device_count for sharding alignment)
+_jax = None
+
+
+def _get_jax():
+    """Import jax once on first use; return the module."""
+    global _jax
+    if _jax is None:
+        import jax as _jax_module
+        _jax = _jax_module
+    return _jax
+
 
 def set_seed(seed: Optional[int] = None) -> np.random.Generator:
     """Set the random seed for reproducibility.
@@ -879,6 +891,43 @@ def _get_batch_size(data) -> int:
     raise TypeError(f"Cannot determine batch size for type {type(data)}")
 
 
+def _align_batch_for_sharding(
+    combined_data,
+    combined_labels,
+    counts: list[int],
+    device_count: int,
+) -> tuple[Any, Any, list[int]] | None:
+    """Truncate batch so dimension 0 is divisible by device_count, or return None to skip.
+
+    Returns (truncated_data, truncated_labels, new_counts) if truncation succeeds,
+    or None if the batch must be skipped (truncation would yield 0 samples).
+    """
+    total = sum(counts)
+    if total % device_count == 0:
+        return combined_data, combined_labels, counts
+
+    new_size = (total // device_count) * device_count
+    if new_size == 0:
+        return None
+
+    # Truncate from the end; update counts to reflect samples kept per loader
+    to_remove = total - new_size
+    new_counts = list(counts)
+    for i in range(len(counts) - 1, -1, -1):
+        if to_remove <= 0:
+            break
+        remove_from_this = min(to_remove, new_counts[i])
+        new_counts[i] -= remove_from_this
+        to_remove -= remove_from_this
+
+    indices = np.arange(new_size)
+    return (
+        slice_data(combined_data, indices),
+        slice_data(combined_labels, indices),
+        new_counts,
+    )
+
+
 class InBatchMixDataLoader(MultiSourceDataLoader):
     """Mix samples from multiple DataLoaders within a single batch.
     
@@ -1054,7 +1103,22 @@ class InBatchMixDataLoader(MultiSourceDataLoader):
 
                 combined_data = concat_data(data_parts)
                 combined_labels = concat_data(label_parts)
+
+                # Truncate or skip batch if sharding requires batch dim divisible by device count
                 if self._apply_sharding is not None:
+                    device_count = _get_jax().device_count()
+                    aligned = _align_batch_for_sharding(
+                        combined_data, combined_labels, counts, device_count
+                    )
+                    if aligned is None:
+                        logging.debug(
+                            "InBatchMixDataLoader: skipping batch of size %d "
+                            "(cannot truncate to satisfy device_count=%d)",
+                            sum(counts),
+                            device_count,
+                        )
+                        continue
+                    combined_data, combined_labels, counts = aligned
                     combined_data = self._apply_sharding(combined_data, self.sharding)
                     combined_labels = self._apply_sharding(combined_labels, self.sharding)
 
