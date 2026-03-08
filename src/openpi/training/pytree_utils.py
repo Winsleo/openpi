@@ -24,7 +24,7 @@ _torch_module = None
 _torch_tensor_type = None
 
 
-def _get_jax():
+def get_jax():
     """Lazy import JAX module."""
     global _jax_module
     if _jax_module is None:
@@ -260,13 +260,42 @@ def slice_data(data, indices):
         return data[indices]
 
     # PyTree case - only import JAX tree utilities when needed
-    jax = _get_jax()
+    jax = get_jax()
     
     # Inline lambda for better performance
     return jax.tree_util.tree_map(
         lambda x: x[indices] if (x is not None and _is_array_like(x)) else x,
         data
     )
+
+
+# ============================================================================
+# Batch Size and Sharding Alignment
+# ============================================================================
+
+def get_batch_size(tree: Any) -> int | None:
+    """Get batch size (dim 0) from the first array-like leaf in a PyTree.
+
+    Works with single arrays, tuples, dicts, or nested structures.
+    Returns None if no array-like leaf with a batch dimension is found.
+    """
+    jax = get_jax()
+    for leaf in jax.tree_util.tree_leaves(tree):
+        if hasattr(leaf, "shape") and len(leaf.shape) > 0:
+            return int(leaf.shape[0])
+    return None
+
+
+def aligned_size_for_sharding(size: int, device_count: int) -> int | None:
+    """Return size aligned to device_count, or None if must skip.
+
+    When size is not divisible by device_count, truncates to the largest
+    multiple. Returns None when truncation would yield 0 samples.
+    """
+    if size % device_count == 0:
+        return size
+    new_size = (size // device_count) * device_count
+    return new_size if new_size > 0 else None
 
 
 # ============================================================================
@@ -327,7 +356,7 @@ def concat_data(data_list: Sequence[Any]):
     
     # Fast path: JAX arrays
     if is_jax_array(first):
-        jax = _get_jax()
+        jax = get_jax()
         return jax.numpy.concatenate(non_none_data, axis=0)
     
     # Fast path: PyTorch tensors
@@ -338,7 +367,7 @@ def concat_data(data_list: Sequence[Any]):
         return torch.cat(non_none_data, dim=0)
     
     # PyTree case
-    jax = _get_jax()
+    jax = get_jax()
     
     # Pre-compile concat function for reuse
     def _concat_leaf(*items):
@@ -402,7 +431,7 @@ def get_sharding(data):
         return None
     
     # Only import JAX if we detected JAX arrays
-    jax = _get_jax()
+    jax = get_jax()
     
     # Use getattr for safe access with minimal overhead
     return jax.tree_map(
@@ -438,7 +467,7 @@ def apply_sharding(data, sharding):
     if sharding is None:
         return data
 
-    jax = _get_jax()
+    jax = get_jax()
 
     # Case 1: a single, global Sharding object for all JAX leaves in `data`.
     if _is_sharding_object(sharding):
@@ -532,12 +561,15 @@ def shard_batch(batch, data_sharding):
 # ============================================================================
 
 __all__ = [
+    'get_jax',
     # Type checking
     'is_jax_array',
     'contains_jax_array',
     # Data manipulation
     'slice_data',
     'concat_data',
+    'get_batch_size',
+    'aligned_size_for_sharding',
     # Sharding
     'get_sharding',
     'apply_sharding',

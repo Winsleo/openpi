@@ -36,7 +36,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader as TorchDataLoader, Dataset as TorchDataset
 from openpi.training.loader_ident import get_loader_ident
-from openpi.training.pytree_utils import slice_data, concat_data
+from openpi.training.pytree_utils import (
+    get_jax,
+    aligned_size_for_sharding,
+    concat_data,
+    get_batch_size,
+    slice_data,
+)
 
 
 # =============================================================================
@@ -857,13 +863,52 @@ class DynamicScheduleDataLoader(RandomMixDataLoader):
 # In-Batch Mix DataLoader
 # =============================================================================
 
-def _get_batch_size(data) -> int:
-    """Get batch size from data (typically actions/labels which are always arrays)."""
-    if hasattr(data, 'shape'):
-        return data.shape[0]
-    if hasattr(data, '__len__'):
-        return len(data)
-    raise TypeError(f"Cannot determine batch size for type {type(data)}")
+_FETCH_STOPPED = object()
+"""Sentinel returned by _fetch_one when iterator raises StopIteration."""
+
+
+def _fetch_one(iterator):
+    """Fetch one batch from *iterator*, returning the batch or ``_FETCH_STOPPED``."""
+    try:
+        return next(iterator)
+    except StopIteration:
+        return _FETCH_STOPPED
+
+
+def _align_batch_for_sharding(
+    combined_data,
+    combined_labels,
+    counts: list[int],
+    device_count: int,
+) -> tuple[Any, Any, list[int]] | None:
+    """Truncate batch so dimension 0 is divisible by device_count, or return None to skip.
+
+    Returns (truncated_data, truncated_labels, new_counts) if truncation succeeds,
+    or None if the batch must be skipped (truncation would yield 0 samples).
+    """
+    total = sum(counts)
+    new_size = aligned_size_for_sharding(total, device_count)
+    if new_size is None:
+        return None
+    if new_size == total:
+        return combined_data, combined_labels, counts
+
+    # Truncate from the end; update counts to reflect samples kept per loader
+    to_remove = total - new_size
+    new_counts = list(counts)
+    for i in range(len(counts) - 1, -1, -1):
+        if to_remove <= 0:
+            break
+        remove_from_this = min(to_remove, new_counts[i])
+        new_counts[i] -= remove_from_this
+        to_remove -= remove_from_this
+
+    s = slice(new_size)
+    return (
+        slice_data(combined_data, s),
+        slice_data(combined_labels, s),
+        new_counts,
+    )
 
 
 class InBatchMixDataLoader(MultiSourceDataLoader):
@@ -941,7 +986,9 @@ class InBatchMixDataLoader(MultiSourceDataLoader):
             ``(sliced_data, sliced_labels, actual_count)`` where
             *actual_count* is ``min(batch_size, num_samples)``.
         """
-        batch_size = _get_batch_size(labels)
+        batch_size = get_batch_size(labels)
+        if batch_size is None:
+            raise TypeError(f"Cannot determine batch size for type {type(labels)}")
         if batch_size <= num_samples:
             return data, labels, batch_size
         if self._random_sample:
@@ -989,6 +1036,7 @@ class InBatchMixDataLoader(MultiSourceDataLoader):
         max_iters = max(len(ld) for ld in self.dataloaders) if is_longest else float('inf')
         iters_done = 0
 
+        device_count = get_jax().device_count() if self._apply_sharding is not None else 0
         while iters_done < max_iters:
             ok = self._fetch_serial(iterators, is_longest, data_parts, label_parts, counts)
             if not ok:
@@ -996,7 +1044,20 @@ class InBatchMixDataLoader(MultiSourceDataLoader):
 
             combined_data = concat_data(data_parts)
             combined_labels = concat_data(label_parts)
+
             if self._apply_sharding is not None:
+                aligned = _align_batch_for_sharding(
+                    combined_data, combined_labels, counts, device_count
+                )
+                if aligned is None:
+                    logging.debug(
+                        "InBatchMixDataLoader: skipping batch of size %d "
+                        "(not divisible by device_count=%d)",
+                        sum(counts),
+                        device_count,
+                    )
+                    continue
+                combined_data, combined_labels, counts = aligned
                 combined_data = self._apply_sharding(combined_data, self.sharding)
                 combined_labels = self._apply_sharding(combined_labels, self.sharding)
 
