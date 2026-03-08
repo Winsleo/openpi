@@ -18,6 +18,11 @@ import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.training.composable_dataloader as composable
 import openpi.transforms as _transforms
+from openpi.training.pytree_utils import (
+    aligned_size_for_sharding,
+    get_batch_size,
+    slice_data,
+)
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -484,11 +489,30 @@ def _default_jax_sharding() -> jax.sharding.Sharding:
 
 
 def _make_batch_transform(sharding: jax.sharding.Sharding | None):
-    """Return a per-batch transform that applies *sharding* or falls back to tensors."""
+    """Return a per-batch transform that applies *sharding* or falls back to tensors.
+
+    When sharding is set, truncates or skips batches whose size is not divisible
+    by device_count to avoid JAX device_put errors.
+    """
     if sharding is not None:
-        return lambda batch: jax.tree.map(
-            lambda x: jax.make_array_from_process_local_data(sharding, x), batch
-        )
+        device_count = jax.device_count()
+        def _transform(batch):
+            batch_size = get_batch_size(batch)
+            if batch_size is not None:
+                new_size = aligned_size_for_sharding(batch_size, device_count)
+                if new_size is None:
+                    logging.debug(
+                        "Skipping batch of size %d (not divisible by device_count=%d)",
+                        batch_size,
+                        device_count,
+                    )
+                    return None
+                if new_size != batch_size:
+                    batch = slice_data(batch, slice(new_size))
+            return jax.tree.map(
+                lambda x: jax.make_array_from_process_local_data(sharding, x), batch
+            )
+        return _transform
     return lambda batch: jax.tree.map(torch.as_tensor, batch)
 
 
@@ -614,8 +638,11 @@ def _batched_iter(source, num_batches: int | None, transform_fn):
             except StopIteration:
                 epoch += 1
                 break
+            result = transform_fn(batch)
+            if result is None:
+                continue
             num_items += 1
-            yield transform_fn(batch)
+            yield result
 
 
 class RLDSDataLoader:
