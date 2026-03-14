@@ -31,6 +31,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 import itertools
 import logging
+import sys
 from typing import Any, Optional, Protocol, TypeVar, Union, runtime_checkable
 import numpy as np
 import torch
@@ -1322,10 +1323,7 @@ class RefreshableDataLoader(SingleLoaderWrapper):
 
     def __len__(self):
         if self._num_epochs is None:
-            raise TypeError(
-                "RefreshableDataLoader with num_epochs=None (infinite) has no len(). "
-                "Set num_epochs to a finite value to use len()."
-            )
+            return sys.maxsize
         return self._num_epochs * len(self._inner)
 
     @staticmethod
