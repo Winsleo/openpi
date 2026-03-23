@@ -96,6 +96,8 @@ __all__ = [
     # Random seed management
     "set_seed",
     "get_rng",
+    # Utility functions
+    "normalize_weights",
     # Batch-count sentinels
     "LONGEST",
     "SHORTEST",
@@ -200,19 +202,22 @@ AnyDataLoader = BaseDataLoader
 # Utility Functions
 # =============================================================================
 
-def _normalize_weights(weights: Sequence[float]) -> np.ndarray:
-    """Normalize *weights* to a probability distribution (sums to 1).
+def normalize_weights(weights: Sequence[float]) -> np.ndarray:
+    """Normalize non-negative weights to sum to 1.
 
     Raises:
-        ValueError: If any weight is negative or all weights are zero.
+        ValueError: If weights are empty, multi-dimensional, contain negative
+            values, or all weights sum to 0.
     """
     w = np.asarray(weights, dtype=np.float64)
-    if (w < 0).any():
-        raise ValueError(f"Weights must be non-negative, got {weights}")
-    total = w.sum()
-    if total == 0:
-        raise ValueError("Weights must not all be zero")
-    return w / total
+    if w.ndim != 1 or w.size == 0:
+        raise ValueError("weights must be a non-empty 1D sequence")
+    if np.any(w < 0):
+        raise ValueError(f"weights must be non-negative, got {weights}")
+    s = float(w.sum())
+    if s <= 0:
+        raise ValueError("weights must not all be zero")
+    return w / s
 
 
 def _weighted_choice(
@@ -475,7 +480,7 @@ class RandomMixDataLoader(MultiSourceDataLoader):
         stop_strategy: str = LONGEST,
     ):
         super().__init__(dataloaders, stop_strategy)
-        self.weights = _normalize_weights(
+        self.weights = normalize_weights(
             weights if weights is not None else [1.0] * self._num_loaders
         )
 
@@ -553,7 +558,7 @@ class ProportionalMixDataLoader(MultiSourceDataLoader):
         stop_strategy: str = LONGEST,
     ):
         super().__init__(dataloaders, stop_strategy)
-        ratios_arr = _normalize_weights(
+        ratios_arr = normalize_weights(
             ratios if ratios is not None else [1.0] * self._num_loaders
         )
         lengths_over_ratios = [len(ld) / r for ld, r in zip(self.dataloaders, ratios_arr)]
