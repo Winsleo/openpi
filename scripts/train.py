@@ -71,10 +71,9 @@ def _prepare_validation_config(
 
     use_norm_stats = False
     
-    # Determine the data factory to use for validation
-    # When using composable_data, get the first dataset config as reference
-    if config.composable_data is not None and config.composable_data.dataset_configs:
-        data_factory = config.composable_data.dataset_configs[0]
+    # When using composable_data, use the first leaf DataConfigFactory as reference (e.g. repo_id).
+    if config.composable_data is not None:
+        data_factory = _config.primary_data_config_factory(config.composable_data) or val_config.data
     else:
         data_factory = val_config.data
     
