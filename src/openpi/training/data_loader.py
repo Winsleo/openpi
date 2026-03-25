@@ -16,7 +16,8 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
-import openpi.training.composable_dataloader as composable
+import openpi.training.composable_dataloader as _composable_dataloader
+import openpi.training.composable_sampler as _composable_sampler
 import openpi.transforms as _transforms
 from openpi.training.pytree_utils import (
     aligned_size_for_sharding,
@@ -229,6 +230,21 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
     )
 
 
+def _build_transformed_training_dataset(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig,
+    *,
+    skip_norm_stats: bool = False,
+) -> Dataset:
+    """Create raw dataset (LeRobot or B1K behavior), then apply repack/normalize/model transforms."""
+    if data_config.behavior_dataset_root is not None:
+        raw = create_behavior_dataset(data_config, action_horizon)
+    else:
+        raw = create_torch_dataset(data_config, action_horizon, model_config)
+    return transform_dataset(raw, data_config, skip_norm_stats=skip_norm_stats)
+
+
 def transform_iterable_dataset(
     dataset: IterableDataset,
     data_config: _config.DataConfig,
@@ -268,6 +284,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    pack_as_observation: bool = True,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -281,6 +298,8 @@ def create_data_loader(
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
+        pack_as_observation: If False, yield ``(observation_dict, actions)`` for composable
+            mixing (inbatch slice/concat on dicts). Default True for normal training.
     
     Note:
         If config.composable_data is set, this function will automatically use
@@ -296,6 +315,7 @@ def create_data_loader(
             shuffle=shuffle,
             num_batches=num_batches,
             skip_norm_stats=skip_norm_stats,
+            framework=framework,
         )
     
     if data_config is None:
@@ -316,6 +336,7 @@ def create_data_loader(
             num_batches=num_batches,
             skip_norm_stats=skip_norm_stats,
             framework=framework,
+            pack_as_observation=pack_as_observation,
         )
     elif data_config.behavior_dataset_root is not None:
         # Handle behavior datasets by reusing create_behavior_data_loader
@@ -326,6 +347,7 @@ def create_data_loader(
             shuffle=shuffle,
             num_batches=num_batches,
             skip_norm_stats=skip_norm_stats,
+            pack_as_observation=pack_as_observation,
         )
     else:
         return create_torch_data_loader(
@@ -340,6 +362,7 @@ def create_data_loader(
             seed=config.seed,
             skip_norm_stats=skip_norm_stats,
             framework=framework,
+            pack_as_observation=pack_as_observation,
         )
 
 
@@ -351,11 +374,16 @@ def create_behavior_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
+    pack_as_observation: bool = True,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     if data_config is None:
         data_config = config.data.create(config.assets_dirs, config.model)
-    dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    dataset = _build_transformed_training_dataset(
+        data_config,
+        config.model.action_horizon,
+        config.model,
+        skip_norm_stats=skip_norm_stats,
+    )
 
     data_loader = TorchDataLoader(
         dataset,
@@ -367,7 +395,7 @@ def create_behavior_data_loader(
         seed=config.seed,
     )
 
-    return DataLoaderImpl(data_config, data_loader)
+    return DataLoaderImpl(data_config, data_loader, pack_as_observation=pack_as_observation)
 
 
 def create_torch_data_loader(
@@ -383,6 +411,7 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    pack_as_observation: bool = True,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -400,9 +429,11 @@ def create_torch_data_loader(
         num_workers: The number of worker processes to use. If zero, the data loader will
             execute in the main process.
         seed: The seed to use for shuffling the data.
+        pack_as_observation: Passed through to :class:`DataLoaderImpl`.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    dataset = _build_transformed_training_dataset(
+        data_config, action_horizon, model_config, skip_norm_stats=skip_norm_stats
+    )
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
@@ -436,7 +467,7 @@ def create_torch_data_loader(
         framework=framework,
     )
 
-    return DataLoaderImpl(data_config, data_loader)
+    return DataLoaderImpl(data_config, data_loader, pack_as_observation=pack_as_observation)
 
 
 def create_rlds_data_loader(
@@ -449,6 +480,7 @@ def create_rlds_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     framework: str = "jax",
+    pack_as_observation: bool = True,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create an RLDS data loader for training.
 
@@ -477,7 +509,7 @@ def create_rlds_data_loader(
         num_batches=num_batches,
     )
 
-    return DataLoaderImpl(data_config, data_loader)
+    return DataLoaderImpl(data_config, data_loader, pack_as_observation=pack_as_observation)
 
 
 def _default_jax_sharding() -> jax.sharding.Sharding:
@@ -593,7 +625,13 @@ class TorchDataLoader:
         return self._num_batches
 
     def __iter__(self):
-        yield from _batched_iter(self._data_loader, self._num_batches, _make_batch_transform(self._sharding))
+        sampler = getattr(self._data_loader, "sampler", None)
+        yield from _batched_iter(
+            self._data_loader,
+            self._num_batches,
+            _make_batch_transform(self._sharding),
+            epoch_sampler=sampler,
+        )
 
     def __len__(self) -> int:
         if self._num_batches is not None:
@@ -616,19 +654,32 @@ def _worker_init_fn(worker_id: int) -> None:
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 
-def _batched_iter(source, num_batches: int | None, transform_fn):
+def _batched_iter(
+    source,
+    num_batches: int | None,
+    transform_fn,
+    *,
+    epoch_sampler: torch.utils.data.Sampler | None = None,
+):
     """Iterate over *source* with an optional batch-count limit, looping if needed.
 
     When *num_batches* is ``None`` the source is iterated exactly once.
     Otherwise the source is re-iterated as needed until *num_batches*
     batches have been yielded.  Each raw batch is passed through
     *transform_fn* before being yielded.
+
+    If *epoch_sampler* is provided and has ``set_epoch``, it is called at the
+    start of each pass over *source* (epoch 0, 1, ...) so samplers such as
+    :class:`openpi.training.composable_sampler.ComposableSampler` reshuffle
+    across epochs when looping.
     """
     epoch = 0
     num_items = 0
     while True:
         if num_batches is None and epoch > 0:
             return
+        if epoch_sampler is not None and hasattr(epoch_sampler, "set_epoch"):
+            epoch_sampler.set_epoch(epoch)
         data_iter = iter(source)
         while True:
             if num_batches is not None and num_items >= num_batches:
@@ -723,9 +774,32 @@ class BaseDataLoaderAdapter:
 
 
 class DataLoaderImpl(BaseDataLoaderAdapter):
+    """Bridges low-level batch dicts to training batches.
+
+    When ``pack_as_observation`` is False (composable mixing leaves), yields
+    ``(observation_dict, actions)`` so strategies like inbatch can slice/concat
+    numpy dict trees; :class:`ComposableDataLoaderWrapper` then calls
+    :meth:`Observation.from_dict` once at the boundary.
+    """
+
+    def __init__(
+        self,
+        data_config: _config.DataConfig,
+        inner,
+        *,
+        pack_as_observation: bool = True,
+    ):
+        super().__init__(data_config, inner)
+        self._pack_as_observation = pack_as_observation
+
     def __iter__(self):
         for batch in self._inner:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            actions = batch["actions"]
+            if self._pack_as_observation:
+                yield _model.Observation.from_dict(batch), actions
+            else:
+                obs_dict = {k: v for k, v in batch.items() if k != "actions"}
+                yield obs_dict, actions
 
 
 # =============================================================================
@@ -741,7 +815,7 @@ class ComposableDataLoaderWrapper(BaseDataLoaderAdapter):
 
     def __init__(
         self,
-        composable_loader: composable.ComposableDataLoader,
+        composable_loader: _composable_dataloader.BaseDataLoader[Any],
         primary_data_config: _config.DataConfig,
         return_source: bool = False,
     ):
@@ -772,6 +846,172 @@ class ComposableDataLoaderWrapper(BaseDataLoaderAdapter):
         return obs, actions, source
 
 
+def _torch_dataset_from_factory(
+    config: _config.TrainConfig,
+    factory: _config.DataConfigFactory,
+    *,
+    skip_norm_stats: bool,
+) -> tuple[torch.utils.data.Dataset, _config.DataConfig]:
+    # factory.create only needs assets_dirs and model_config; no need to rebuild TrainConfig.
+    data_config = factory.create(config.assets_dirs, config.model)
+    ds = _build_transformed_training_dataset(
+        data_config,
+        config.model.action_horizon,
+        config.model,
+        skip_norm_stats=skip_norm_stats,
+    )
+    return ds, data_config
+
+
+# Each leaf entry carries: factory, shuffle_within_leaf from its direct parent, and
+# the local index of this leaf within that parent (used for stable per-parent seed derivation).
+LeafEntry = tuple[_config.DataConfigFactory, bool, int | None, int]
+# fields: (factory, shuffle_within_leaf, parent_seed, local_idx_in_parent)
+
+
+def _dfs_sampler_factories(
+    node: _config.ComposableSamplerConfig,
+) -> list[LeafEntry]:
+    """DFS leaf order.
+
+    Returns a flat list of (factory, shuffle_within_leaf, parent_seed, local_idx_in_parent)
+    so that each leaf's seed can be derived from its direct parent's seed and its
+    position within that parent, independent of the global DFS order.
+    """
+    out: list[LeafEntry] = []
+    local_idx = 0
+    for child in node.children:
+        if isinstance(child, _config.DataConfigFactory):
+            out.append((child, node.shuffle_within_leaf, node.seed, local_idx))
+            local_idx += 1
+        else:
+            out.extend(_dfs_sampler_factories(child))
+            local_idx += 1
+    return out
+
+
+def _build_mix_node_tree(
+    cfg: _config.ComposableSamplerConfig,
+    leaf_iter: Iterator[_composable_sampler.LeafNode],
+    depth: int,
+) -> _composable_sampler.SamplerNode:
+    """Recursively build a MixNode tree that mirrors the ComposableSamplerConfig tree.
+
+    Uses an iterator over the pre-built LeafNode list (DFS order) so that each
+    DataConfigFactory leaf is consumed exactly once without index bookkeeping.
+    Each MixNode uses the seed from its own config level (cfg.seed), not a
+    depth-derived offset, so nested configs remain independently reproducible.
+    """
+    children_sn: list[_composable_sampler.SamplerNode] = []
+    for child in cfg.children:
+        if isinstance(child, _config.DataConfigFactory):
+            children_sn.append(next(leaf_iter))
+        else:
+            children_sn.append(_build_mix_node_tree(child, leaf_iter, depth + 1))
+    strategy = _composable_sampler.mix_strategy_from_name(cfg.mix_strategy, temperature=cfg.temperature)
+    w = list(cfg.weights) if cfg.weights is not None else [1.0] * len(children_sn)
+    return _composable_sampler.MixNode(
+        children=children_sn,
+        weights=w,
+        strategy=strategy,
+        seed=cfg.seed,  # each level uses its own seed, not a depth-derived offset
+        name=f"sampler_mix_d{depth}",
+    )
+
+
+def _build_from_composable_sampler_config(
+    config: _config.TrainConfig,
+    node: _config.ComposableSamplerConfig,
+    *,
+    sharding: jax.sharding.Sharding | None,
+    shuffle: bool,
+    skip_norm_stats: bool,
+    num_batches: int | None,
+    framework: Literal["jax", "pytorch"] = "jax",
+    _depth: int = 0,
+) -> tuple[_composable_dataloader.BaseDataLoader, _config.DataConfig]:
+    """Build ConcatDataset + nested MixNode + ComposableSampler + TorchDataLoader.
+
+    The ``shuffle`` parameter is intentionally ignored: leaf-level shuffling is
+    controlled by ``ComposableSamplerConfig.shuffle_within_leaf`` on each node.
+    """
+    if shuffle:
+        logging.debug(
+            "ComposableSamplerConfig: shuffle=True is ignored at this node; "
+            "use shuffle_within_leaf=True on the config to control leaf-level shuffling."
+        )
+
+    leaf_entries = _dfs_sampler_factories(node)
+    datasets: list[torch.utils.data.Dataset] = []
+    data_configs: list[_config.DataConfig] = []
+    primary_dc: _config.DataConfig | None = None
+    for factory, _shuffle_leaf, _parent_seed, _local_idx in leaf_entries:
+        ds, dc = _torch_dataset_from_factory(config, factory, skip_norm_stats=skip_norm_stats)
+        datasets.append(ds)
+        data_configs.append(dc)
+        if primary_dc is None:
+            primary_dc = dc
+    assert primary_dc is not None
+
+    concat_ds = torch.utils.data.ConcatDataset(datasets)
+    off = 0
+    leaf_nodes: list[_composable_sampler.LeafNode] = []
+    for i, (dc, ds, (_, shuffle_leaf, parent_seed, local_idx)) in enumerate(
+        zip(data_configs, datasets, leaf_entries)
+    ):
+        ln_seed = None if parent_seed is None else int(parent_seed) + local_idx * 10_007
+        L = len(ds)
+        leaf_nodes.append(
+            _composable_sampler.LeafNode(
+                length=int(L),
+                offset=int(off),
+                shuffle=shuffle_leaf,
+                seed=ln_seed,
+                name=str(dc.repo_id) if dc.repo_id is not None else f"leaf_{i}",
+            )
+        )
+        off += int(L)
+
+    leaf_iter = iter(leaf_nodes)
+    root_mix = _build_mix_node_tree(node, leaf_iter, 0)
+    remaining = list(leaf_iter)
+    if remaining:
+        raise RuntimeError(
+            f"internal error: {len(remaining)} leaf node(s) not consumed building MixNode tree"
+        )
+
+    num_samples = node.num_samples if node.num_samples is not None else int(off)
+    local_bs = config.batch_size // jax.process_count()
+    if len(concat_ds) < local_bs:
+        raise ValueError(
+            f"ComposableSampler ConcatDataset length ({len(concat_ds)}) must be >= local batch size ({local_bs}). "
+            f"Reduce batch_size or use larger leaf datasets."
+        )
+    if num_samples < local_bs:
+        raise ValueError(
+            f"ComposableSampler num_samples ({num_samples}) must be >= local batch size ({local_bs}). "
+            f"Increase num_samples or reduce batch_size."
+        )
+    sampler = _composable_sampler.ComposableSampler(root=root_mix, num_samples=num_samples)
+    inner = TorchDataLoader(
+        concat_ds,
+        local_batch_size=local_bs,
+        sharding=sharding,
+        shuffle=False,
+        sampler=sampler,
+        num_batches=num_batches,
+        num_workers=config.num_workers,
+        seed=config.seed if config.seed is not None else 0,
+        framework=framework,
+    )
+    indent = "  " * _depth
+    logging.info(
+        f"{indent}  +-- ComposableSampler(leaves={len(leaf_nodes)}, strategy={node.mix_strategy}, "
+        f"num_samples={num_samples})"
+    )
+    return DataLoaderImpl(primary_dc, inner, pack_as_observation=False), primary_dc
+
+
 def _build_composable_from_node(
     config: _config.TrainConfig,
     node: _config.ComposableNode,
@@ -780,10 +1020,11 @@ def _build_composable_from_node(
     shuffle: bool,
     skip_norm_stats: bool,
     num_batches: int | None,
+    framework: Literal["jax", "pytorch"] = "jax",
     return_source: bool = False,
     _is_root: bool = True,
     _depth: int = 0,
-) -> tuple[composable.BaseDataLoader, _config.DataConfig]:
+) -> tuple[_composable_dataloader.BaseDataLoader, _config.DataConfig]:
     """Recursively build a composable loader from a config node.
 
     Args:
@@ -805,12 +1046,29 @@ def _build_composable_from_node(
             shuffle=shuffle,
             num_batches=num_batches,
             skip_norm_stats=skip_norm_stats,
+            framework=framework,
+            pack_as_observation=False,
         )
         data_config = loader.data_config()
         logging.info(f"{indent}  +-- Dataset: {data_config.repo_id}")
         return loader, data_config
 
-    # node is ComposableDataConfig — extract node-level num_batches if set
+    if isinstance(node, _config.ComposableSamplerConfig):
+        return _build_from_composable_sampler_config(
+            config,
+            node,
+            sharding=sharding,
+            shuffle=shuffle,
+            skip_norm_stats=skip_norm_stats,
+            num_batches=num_batches,
+            framework=framework,
+            _depth=_depth,
+        )
+
+    if not isinstance(node, _config.ComposableDataConfig):
+        raise TypeError(f"Unexpected composable node type: {type(node)}")
+
+    # ComposableDataConfig - extract node-level num_batches if set
     if node.num_batches is not None:
         num_batches = node.num_batches
 
@@ -820,19 +1078,26 @@ def _build_composable_from_node(
 
     strategy = node.composition_strategy
     weights = node.weights
+    process_count = max(1, jax.process_count())
     if strategy == "inbatch":
-        samples_per_loader = _compute_samples_per_loader(
-            weights, len(inputs), config.batch_size
-        )
+        # Allocate per-process sample counts so they sum to local batch size; scale child
+        # TrainConfig.batch_size by process_count so each leaf TorchDataLoader still yields
+        # samples_per_loader[i] samples per step after dividing by process_count.
+        local_batch = config.batch_size // process_count
+        inbatch_w = list(weights) if weights is not None else [1.0] * len(inputs)
+        samples_per_loader = _composable_sampler.largest_remainder_allocate(
+            local_batch, inbatch_w
+        ).tolist()
     else:
         samples_per_loader = None
 
-    child_loaders: list[composable.BaseDataLoader] = []
+    child_loaders: list[_composable_dataloader.BaseDataLoader] = []
     primary_data_config: _config.DataConfig | None = None
 
     for i, child in enumerate(inputs):
         if strategy == "inbatch":
-            child_config = dataclasses.replace(config, batch_size=samples_per_loader[i])
+            child_global_bs = samples_per_loader[i] * process_count
+            child_config = dataclasses.replace(config, batch_size=child_global_bs)
         else:
             child_config = config
         sub_loader, sub_data_config = _build_composable_from_node(
@@ -842,6 +1107,7 @@ def _build_composable_from_node(
             shuffle=shuffle,
             skip_norm_stats=skip_norm_stats,
             num_batches=num_batches,
+            framework=framework,
             return_source=return_source,
             _is_root=False,
             _depth=_depth + 1,
@@ -859,25 +1125,25 @@ def _build_composable_from_node(
     if num_loaders == 1:
         composed = child_loaders[0]
     elif strategy == "random":
-        composed = composable.Compose.random(*child_loaders, weights=weights, stop_strategy=stop_strategy)
+        composed = _composable_dataloader.Compose.random(*child_loaders, weights=weights, stop_strategy=stop_strategy)
     elif strategy == "proportional":
-        composed = composable.Compose.proportional(*child_loaders, ratios=weights, stop_strategy=stop_strategy)
+        composed = _composable_dataloader.Compose.proportional(*child_loaders, ratios=weights, stop_strategy=stop_strategy)
     elif strategy == "round_robin":
-        composed = composable.Compose.round_robin(*child_loaders, stop_strategy=stop_strategy)
+        composed = _composable_dataloader.Compose.round_robin(*child_loaders, stop_strategy=stop_strategy)
     elif strategy == "alternating":
-        composed = composable.Compose.alternating(*child_loaders, pattern=pattern, stop_strategy=stop_strategy)
+        composed = _composable_dataloader.Compose.alternating(*child_loaders, pattern=pattern, stop_strategy=stop_strategy)
     elif strategy == "tagged":
         names = task_names or _unique_source_names(inputs)
         loaders_dict = dict(zip(names, child_loaders))
-        composed = composable.Compose.tagged(loaders_dict, sampling_strategy="random", stop_strategy=stop_strategy)
+        composed = _composable_dataloader.Compose.tagged(loaders_dict, sampling_strategy="random", stop_strategy=stop_strategy)
     elif strategy == "dynamic":
-        composed = composable.Compose.dynamic(*child_loaders, initial_weights=weights, stop_strategy=stop_strategy)
+        composed = _composable_dataloader.Compose.dynamic(*child_loaders, initial_weights=weights, stop_strategy=stop_strategy)
     elif strategy == "inbatch":
         logging.info(
-            f"inbatch: num_loaders={num_loaders}, batch_size={config.batch_size}, "
-            f"samples_per_loader={samples_per_loader}"
+            f"inbatch: num_loaders={num_loaders}, global_batch_size={config.batch_size}, "
+            f"per_process_samples_per_loader={samples_per_loader}"
         )
-        composed = composable.Compose.inbatch(
+        composed = _composable_dataloader.Compose.inbatch(
             *child_loaders,
             samples_per_loader=samples_per_loader,
             random_sample=node.inbatch_random_sample,
@@ -891,7 +1157,7 @@ def _build_composable_from_node(
         logging.info(f"{indent}{level_marker} passthrough(children=1)")
     else:
         weights_info = f" weights={list(weights)}" if weights else ""
-        stop_info = f" stop={stop_strategy}" if stop_strategy != composable.LONGEST else ""
+        stop_info = f" stop={stop_strategy}" if stop_strategy != _composable_dataloader.LONGEST else ""
         logging.info(
             f"{indent}{level_marker} Compose.{strategy}(children={num_loaders}{weights_info}{stop_info})"
         )
@@ -899,7 +1165,7 @@ def _build_composable_from_node(
     # Wrap with RefreshableDataLoader if refresh_every is set at this level
     # (must be done before SourceTagged so that source tags remain consistent across epochs)
     if node.refresh_every is not None:
-        composed = composable.RefreshableDataLoader(
+        composed = _composable_dataloader.RefreshableDataLoader(
             composed,
             on_refresh=node.on_refresh,
             refresh_every=node.refresh_every,
@@ -912,7 +1178,7 @@ def _build_composable_from_node(
     # is enabled. Root wrapping is handled by create_composable_data_loader.
     if return_source and not _is_root:
         source_names = _unique_source_names(inputs)
-        composed = composable.SourceTaggedDataLoader(composed, source_names)
+        composed = _composable_dataloader.SourceTaggedDataLoader(composed, source_names)
         logging.info(f"{indent}   -> SourceTaggedDataLoader(sources={source_names})")
 
     assert primary_data_config is not None
@@ -924,17 +1190,21 @@ def _unique_source_names(inputs: Sequence[_config.ComposableNode]) -> list[str]:
 
     For DataConfigFactory leaves, uses repo_id if available.
     For ComposableDataConfig nodes, uses 'group_<index>'.
+    For ComposableSamplerConfig nodes, uses 'sampler_<index>'.
     Duplicates at the same level get '_0', '_1', etc. suffixes.
     """
     from collections import Counter
 
-    # Collect base names
-    base_names = [
-        getattr(node, "repo_id", None) or f"dataset_{i}"
-        if isinstance(node, _config.DataConfigFactory)
-        else f"group_{i}"
-        for i, node in enumerate(inputs)
-    ]
+    def _base_name(i: int, node: _config.ComposableNode) -> str:
+        if isinstance(node, _config.DataConfigFactory):
+            return getattr(node, "repo_id", None) or f"dataset_{i}"
+        if isinstance(node, _config.ComposableDataConfig):
+            return f"group_{i}"
+        if isinstance(node, _config.ComposableSamplerConfig):
+            return f"sampler_{i}"
+        return f"node_{i}"
+
+    base_names = [_base_name(i, n) for i, n in enumerate(inputs)]
 
     # Add suffixes for duplicates
     counts = Counter(base_names)
@@ -950,48 +1220,31 @@ def _unique_source_names(inputs: Sequence[_config.ComposableNode]) -> list[str]:
     return result
 
 
-def _compute_samples_per_loader(
-    weights: Sequence[float] | None,
-    num_loaders: int,
-    batch_size: int,
-) -> list[int]:
-    """Compute per-loader sample counts for inbatch mixing."""
-    if weights is not None:
-        w = np.array(weights, dtype=np.float64)
-        w /= w.sum()
-        samples = (w * batch_size).astype(np.int64)
-        # Distribute remainder to last loader
-        samples[-1] += batch_size - int(samples.sum())
-        return samples.tolist()
-    # Equal split with remainder to last
-    base = batch_size // num_loaders
-    samples = [base] * num_loaders
-    samples[-1] += batch_size - sum(samples)
-    return samples
-
-
 def create_composable_data_loader(
     config: _config.TrainConfig,
-    composable_config: _config.ComposableDataConfig,
+    composable_config: _config.ComposableNode,
     *,
     sharding: jax.sharding.Sharding | None = None,
     shuffle: bool = True,
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
+    framework: Literal["jax", "pytorch"] = "jax",
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a composable data loader that combines multiple datasets (with nesting).
 
-    Builds the loader tree recursively from ``ComposableDataConfig``:
-    each node is either a dataset leaf (``DataConfigFactory``) or a nested
-    ``ComposableDataConfig`` with its own children.
+    The root may be a ``ComposableDataConfig`` (batch-level tree), a
+    ``ComposableSamplerConfig`` (index-level mixing), or a ``DataConfigFactory``
+    (single dataset). Root-level ``return_source`` / root ``SourceTaggedDataLoader``
+    wrapping apply only when the root is ``ComposableDataConfig``.
 
     Args:
         config: Training configuration.
-        composable_config: Root node config, including children / strategy / weights.
+        composable_config: Root composable node.
         sharding: Optional JAX sharding for distributed loading.
         shuffle: Whether to shuffle at the leaf dataset level.
         num_batches: Optional total batch count for proportional strategy at root.
         skip_norm_stats: Whether to skip normalization statistics.
+        framework: Passed to leaf ``TorchDataLoader`` / ``create_data_loader`` (``jax`` or ``pytorch``).
 
     Returns:
         A composed ``DataLoader`` instance.
@@ -1011,15 +1264,14 @@ def create_composable_data_loader(
         ... )
         >>> loader = create_composable_data_loader(config, composable_cfg)
     """
-    seed = composable_config.seed
-    return_source = composable_config.return_source
-    
     logging.info("=" * 70)
     logging.info("Building composable data loader tree...")
-    if seed is not None:
-        composable.set_seed(seed)
-        logging.info(f"Set random seed: {seed}")
-    
+
+    return_source = getattr(composable_config, "return_source", False)
+    seed = getattr(composable_config, "seed", None) or config.seed
+    _composable_dataloader.set_seed(seed)
+    logging.info(f"Set random seed: {seed}")
+
     composed, primary_data_config = _build_composable_from_node(
         config,
         composable_config,
@@ -1027,29 +1279,36 @@ def create_composable_data_loader(
         shuffle=shuffle,
         skip_norm_stats=skip_norm_stats,
         num_batches=num_batches,
+        framework=framework,
         return_source=return_source,
         _depth=0,
     )
 
-    strategy = composable_config.composition_strategy
-    children = composable_config.children
+    if isinstance(composable_config, _config.ComposableDataConfig):
+        strategy = composable_config.composition_strategy
+        children = composable_config.children
+        if return_source and strategy != "tagged":
+            source_names = composable_config.task_names or _unique_source_names(children)
+            composed = _composable_dataloader.SourceTaggedDataLoader(composed, source_names)
+            logging.info(f"[TAG] Root SourceTaggedDataLoader (sources={source_names})")
 
-    # Wrap root with SourceTaggedDataLoader if return_source is enabled
-    if return_source and strategy != "tagged":
-        source_names = composable_config.task_names or _unique_source_names(children)
-        composed = composable.SourceTaggedDataLoader(composed, source_names)
-        logging.info(f"[TAG] Root SourceTaggedDataLoader (sources={source_names})")
-
-    logging.info("=" * 70)
-    logging.info(f"[SUCCESS] Composable data loader created successfully")
-    logging.info(f"  Primary dataset: {primary_data_config.repo_id}")
-    logging.info(f"  Total children: {len(children)}")
-    if composable_config.weights:
-        logging.info(f"  Root weights: {list(composable_config.weights)}")
-    if composable_config.refresh_every is not None:
-        epochs_str = f"{composable_config.num_epochs}" if composable_config.num_epochs else "inf"
-        logging.info(f"  Refresh config: every {composable_config.refresh_every} epochs (total: {epochs_str})")
-    logging.info("=" * 70)
+        logging.info("=" * 70)
+        logging.info("[SUCCESS] Composable data loader created successfully")
+        logging.info(f"  Primary dataset: {primary_data_config.repo_id}")
+        logging.info(f"  Total children: {len(children)}")
+        if composable_config.weights:
+            logging.info(f"  Root weights: {list(composable_config.weights)}")
+        if composable_config.refresh_every is not None:
+            epochs_str = f"{composable_config.num_epochs}" if composable_config.num_epochs else "inf"
+            logging.info(f"  Refresh config: every {composable_config.refresh_every} epochs (total: {epochs_str})")
+        logging.info("=" * 70)
+    else:
+        logging.info("=" * 70)
+        logging.info(
+            f"[SUCCESS] Composable data loader created (root={type(composable_config).__name__})"
+        )
+        logging.info(f"  Primary dataset: {primary_data_config.repo_id}")
+        logging.info("=" * 70)
 
     return ComposableDataLoaderWrapper(composed, primary_data_config, return_source=return_source)
 
@@ -1066,5 +1325,4 @@ def _create_single_dataset_config(
     Important: composable_data is set to None to prevent infinite recursion
     when create_data_loader is called for individual datasets.
     """
-    import dataclasses
     return dataclasses.replace(base_config, data=data_factory, composable_data=None)
