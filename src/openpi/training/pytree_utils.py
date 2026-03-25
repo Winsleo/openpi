@@ -434,7 +434,7 @@ def get_sharding(data):
     jax = get_jax()
     
     # Use getattr for safe access with minimal overhead
-    return jax.tree_map(
+    return jax.tree.map(
         lambda x: getattr(x, 'sharding', None) if is_jax_array(x) else None,
         data,
         is_leaf=is_jax_array
@@ -471,7 +471,7 @@ def apply_sharding(data, sharding):
 
     # Case 1: a single, global Sharding object for all JAX leaves in `data`.
     if _is_sharding_object(sharding):
-        return jax.tree_map(
+        return jax.tree.map(
             lambda d: jax.device_put(d, sharding) if is_jax_array(d) else d,
             data,
             is_leaf=is_jax_array,
@@ -482,7 +482,7 @@ def apply_sharding(data, sharding):
     if not _has_valid_sharding(sharding):
         return data
 
-    return jax.tree_map(
+    return jax.tree.map(
         lambda d, s: jax.device_put(d, s) if (is_jax_array(d) and _is_sharding_object(s)) else d,
         data,
         sharding,
