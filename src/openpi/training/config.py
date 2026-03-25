@@ -4,6 +4,7 @@ import abc
 from collections.abc import Sequence
 import dataclasses
 import difflib
+import functools
 import logging
 import os
 import pathlib
@@ -31,7 +32,8 @@ import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
-import openpi.training.composable_dataloader as composable_dataloader
+import openpi.training.composable_dataloader as _composable_dataloader
+import openpi.training.composable_sampler as _composable_sampler
 
 
 ModelType: TypeAlias = _model.ModelType
@@ -203,14 +205,21 @@ class DataConfigFactory(abc.ABC):
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
         if asset_id is None:
             return None
+        data_assets_dir = str(assets_dir / asset_id)
         try:
-            data_assets_dir = str(assets_dir / asset_id)
-            norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
+            resolved = str(epath.Path(_download.maybe_download(data_assets_dir)))
+            norm_stats = _load_norm_stats_cached(resolved)
             logging.info(f"Loaded norm stats from {data_assets_dir}")
             return norm_stats
         except FileNotFoundError:
             logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
         return None
+
+
+@functools.lru_cache(maxsize=256)
+def _load_norm_stats_cached(resolved_path: str) -> dict[str, _transforms.NormStats]:
+    """Load norm stats from a resolved local path (cached across factories with same asset)."""
+    return _normalize.load(resolved_path)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -518,8 +527,54 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         )
 
 
-# Recursive node: either a dataset (leaf) or another ComposableDataConfig (nested).
-ComposableNode = Union[DataConfigFactory, "ComposableDataConfig"]
+@dataclasses.dataclass(frozen=True)
+class ComposableSamplerConfig:
+    """Index-level mixing: ``ConcatDataset`` over all leaf datasets + nested ``MixNode`` tree.
+
+    Children may be ``DataConfigFactory`` leaves or nested ``ComposableSamplerConfig``
+    (each defines a sub-mix group). Leaf datasets are built in depth-first order and
+    assigned contiguous global indices; the sampler tree mirrors this config tree.
+    """
+
+    children: Sequence[Union[DataConfigFactory, "ComposableSamplerConfig"]] = ()
+
+    mix_strategy: str = _composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER
+    weights: Sequence[float] | None = None
+    seed: int | None = None
+    num_samples: int | None = None
+    shuffle_within_leaf: bool = True
+    temperature: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.children:
+            raise ValueError("ComposableSamplerConfig must have at least one child")
+        if self.mix_strategy not in _composable_sampler.COMPOSABLE_MIX_STRATEGIES:
+            raise ValueError(
+                f"Unknown mix_strategy {self.mix_strategy!r}; "
+                f"expected one of {sorted(_composable_sampler.COMPOSABLE_MIX_STRATEGIES)}"
+            )
+        if self.weights is not None and len(self.weights) != len(self.children):
+            raise ValueError(
+                f"weights length ({len(self.weights)}) must match children length ({len(self.children)})"
+            )
+        if self.temperature is not None:
+            if self.mix_strategy != _composable_sampler.MIX_STRATEGY_WEIGHTED_RANDOM:
+                raise ValueError(
+                    "temperature is only used when mix_strategy is "
+                    f"{_composable_sampler.MIX_STRATEGY_WEIGHTED_RANDOM!r}"
+                )
+            if self.temperature <= 0:
+                raise ValueError("temperature must be > 0")
+        for i, c in enumerate(self.children):
+            if isinstance(c, ComposableDataConfig):
+                raise ValueError(
+                    "ComposableSamplerConfig.children may only contain DataConfigFactory or "
+                    f"ComposableSamplerConfig; got ComposableDataConfig at index {i}"
+                )
+
+
+# Recursive node: dataset leaf, batch-level composable tree, or index-level sampler tree.
+ComposableNode = Union[DataConfigFactory, "ComposableDataConfig", "ComposableSamplerConfig"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -528,8 +583,8 @@ class ComposableDataConfig:
 
     Uses ``children`` to describe a composition tree (supports nesting). Each
     node specifies a ``composition_strategy`` and its parameters. Children can
-    be either dataset leaves (``DataConfigFactory``) or further
-    ``ComposableDataConfig`` nodes.
+    be dataset leaves (``DataConfigFactory``), batch-level nested
+    ``ComposableDataConfig``, or index-level ``ComposableSamplerConfig`` nodes.
 
     Supported strategies (per node):
         - "random": weighted random sampling
@@ -575,7 +630,7 @@ class ComposableDataConfig:
     # Composition strategy
     composition_strategy: str = "random"
     
-    # Weights: for random/proportional use as-is; for inbatch, samples_per_loader = weights * batch_size (normalized)
+    # Weights: for random/proportional use as-is; for inbatch, per-loader counts use largest-remainder on batch_size
     weights: Sequence[float] | None = None
 
     # Pattern indices for alternating strategy
@@ -594,7 +649,7 @@ class ComposableDataConfig:
     # Stop strategy for multi-source loaders: LONGEST (default) or SHORTEST.
     # LONGEST: iterate until all loaders are fully consumed (shorter ones restart).
     # SHORTEST: stop as soon as any loader exhausts.
-    stop_strategy: str = composable_dataloader.LONGEST
+    stop_strategy: str = _composable_dataloader.LONGEST
     
     # Refresh configuration (wraps with RefreshableDataLoader when refresh_every is set)
     # refresh_every: If set (>= 1), enables RefreshableDataLoader with callback interval.
@@ -615,10 +670,12 @@ class ComposableDataConfig:
     seed: int | None = None
 
     def __post_init__(self) -> None:
-        if self.composition_strategy not in composable_dataloader.VALID_COMPOSITION_STRATEGIES:
+        if not self.children:
+            raise ValueError("ComposableDataConfig must have at least one child")
+        if self.composition_strategy not in _composable_dataloader.VALID_COMPOSITION_STRATEGIES:
             raise ValueError(
                 f"Unknown composition_strategy '{self.composition_strategy}'. "
-                f"Valid options: {sorted(composable_dataloader.VALID_COMPOSITION_STRATEGIES)}"
+                f"Valid options: {sorted(_composable_dataloader.VALID_COMPOSITION_STRATEGIES)}"
             )
         if self.weights is not None and len(self.weights) != len(self.children):
             raise ValueError(
@@ -632,6 +689,28 @@ class ComposableDataConfig:
             raise ValueError(f"refresh_every must be >= 1 or None, got {self.refresh_every}")
         if self.num_epochs is not None and self.num_epochs < 1:
             raise ValueError(f"num_epochs must be >= 1 or None, got {self.num_epochs}")
+        if self.composition_strategy == "inbatch" and self.weights is None:
+            logging.warning(
+                "ComposableDataConfig inbatch: weights is None; samples are split equally across children. "
+                "Set explicit weights for a fixed mixing ratio."
+            )
+
+
+def primary_data_config_factory(node: ComposableNode) -> DataConfigFactory | None:
+    """First ``DataConfigFactory`` leaf in preorder DFS.
+
+    Matches the leaf order used when building composable loaders (``primary_data_config``
+    from the first leaf), so validation can reuse the same ``repo_id`` / factory as training.
+    """
+    if isinstance(node, DataConfigFactory):
+        return node
+    if isinstance(node, (ComposableDataConfig, ComposableSamplerConfig)):
+        for child in node.children:
+            found = primary_data_config_factory(child)
+            if found is not None:
+                return found
+        return None
+    return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -667,9 +746,12 @@ class TrainConfig:
     # Determines the data to be trained on (single dataset).
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
     
-    # Optional: Configuration for composable/mixed dataset training.
-    # If set, this takes precedence over 'data' and enables multi-dataset training.
-    composable_data: ComposableDataConfig | None = None
+    # Optional: Root of the composable training data tree (batch-level ComposableDataConfig,
+    # index-level ComposableSamplerConfig, or a single DataConfigFactory). If set, takes
+    # precedence over ``data``. Root-level ``return_source`` / ``refresh_every`` / ``seed``
+    # on ComposableDataConfig apply only when the root is a ComposableDataConfig; for a
+    # ComposableSamplerConfig or DataConfigFactory root, use fields on that node / TrainConfig.seed.
+    composable_data: ComposableNode | None = None
 
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
@@ -913,7 +995,7 @@ _CONFIGS = [
                                 prompt_from_task=True,
                                 num_batches=6,
                                 episodes_index=list(range(100)),
-                                behavior_dataset_root="/data/behavior-1k-dataset",
+                                behavior_dataset_root="/data/behavior-1k/2025-challenge-demos",
                             ),
                         ),
                         LeRobotB1KDataConfig(
@@ -926,7 +1008,7 @@ _CONFIGS = [
                                 prompt_from_task=True,
                                 num_batches=4,
                                 episodes_index=list(range(100, 190)),
-                                behavior_dataset_root="/data/behavior-1k-dataset",
+                                behavior_dataset_root="/data/behavior-1k/2025-challenge-demos",
                             ),
                         ),
                     ],
@@ -943,7 +1025,7 @@ _CONFIGS = [
                         prompt_from_task=True,
                         num_batches=5,
                         episodes_index=list(range(50)),  # Another subset
-                        behavior_dataset_root="/data/behavior-1k-dataset",
+                        behavior_dataset_root="/data/behavior-1k/2025-challenge-demos",
                     ),
                 ),
             ],
@@ -951,6 +1033,86 @@ _CONFIGS = [
             seed=42,
             refresh_every=1,
             num_epochs=2,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/model/pi05_base/params"),
+        num_train_steps=50000,
+        batch_size_per_gpu=32,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=50, paligemma_variant="gemma_2b", freeze_components=["llm_base"]
+        ).get_freeze_filter(),
+        ema_decay=None,
+        val_log_interval=0,
+        val_repo_id="behavior-1k/2025-challenge-demos",
+        val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=min(32, os.cpu_count() - 2),
+    ),
+    # Same three LeRobot leaves and 2:1 / 0.6:0.4 intent as ``pi05_b1k_nested``, but index-level mixing via
+    # nested ``ComposableSamplerConfig`` only (root is a sampler tree, no wrapping ``ComposableDataConfig``).
+    # Root-level ``return_source`` / ``refresh_every`` / ``num_epochs`` apply only when the root is
+    # ``ComposableDataConfig``; use ``TrainConfig.seed`` and per-node ``ComposableSamplerConfig.seed`` here.
+    TrainConfig(
+        name="pi05_b1k_nested_sampler",
+        exp_name="openpi_nested_sampler",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, paligemma_variant="gemma_2b"),
+        seed=42,
+        composable_data=ComposableSamplerConfig(
+            children=[
+                ComposableSamplerConfig(
+                    children=[
+                        LeRobotB1KDataConfig(
+                            repo_id="behavior-1k/2025-challenge-demos",
+                            assets=AssetsConfig(
+                                assets_dir="/model/pi05_base/assets",
+                                asset_id="behavior-1k/2025-challenge-demos",
+                            ),
+                            base_config=DataConfig(
+                                prompt_from_task=True,
+                                num_batches=6,
+                                episodes_index=list(range(100)),
+                                behavior_dataset_root="/data/behavior-1k/2025-challenge-demos",
+                            ),
+                        ),
+                        LeRobotB1KDataConfig(
+                            repo_id="behavior-1k/2025-challenge-demos",
+                            assets=AssetsConfig(
+                                assets_dir="/model/pi05_base/assets",
+                                asset_id="behavior-1k/2025-challenge-demos",
+                            ),
+                            base_config=DataConfig(
+                                prompt_from_task=True,
+                                num_batches=4,
+                                episodes_index=list(range(100, 190)),
+                                behavior_dataset_root="/data/behavior-1k/2025-challenge-demos",
+                            ),
+                        ),
+                    ],
+                    mix_strategy=_composable_sampler.MIX_STRATEGY_WEIGHTED_RANDOM,
+                    weights=[0.6, 0.4],
+                    temperature=1.0,
+                    seed=11,
+                ),
+                LeRobotB1KDataConfig(
+                    repo_id="behavior-1k/2025-challenge-demos",
+                    assets=AssetsConfig(
+                        assets_dir="/model/pi05_base/assets",
+                        asset_id="behavior-1k/2025-challenge-demos",
+                    ),
+                    base_config=DataConfig(
+                        prompt_from_task=True,
+                        num_batches=5,
+                        episodes_index=list(range(50)),
+                        behavior_dataset_root="/data/behavior-1k/2025-challenge-demos",
+                    ),
+                ),
+            ],
+            mix_strategy=_composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER,
+            weights=[2.0, 1.0],
+            seed=22,
+            num_samples=None,
+            shuffle_within_leaf=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/model/pi05_base/params"),
         num_train_steps=50000,
