@@ -18,25 +18,6 @@ import numpy as np
 from torch.utils.data import Sampler
 from openpi.training.composable_dataloader import normalize_weights
 
-# Public type alias: weights can be static or epoch-dependent.
-WeightSpec = Sequence[float] | Callable[[int], Sequence[float]]
-
-# Mix strategy identifiers: ComposableSamplerConfig.mix_strategy, state_dict["type"], MixNode default names.
-MIX_STRATEGY_LARGEST_REMAINDER = "largest_remainder"
-MIX_STRATEGY_WEIGHTED_RANDOM = "weighted_random"
-MIX_STRATEGY_ROUND_ROBIN = "round_robin"
-MIX_STRATEGY_SHUFFLE_SEQUENTIAL = "shuffle_sequential"
-MIX_STRATEGY_STRATIFIED_RANDOM = "stratified_random"
-
-COMPOSABLE_MIX_STRATEGIES: frozenset[str] = frozenset(
-    {
-        MIX_STRATEGY_LARGEST_REMAINDER,
-        MIX_STRATEGY_WEIGHTED_RANDOM,
-        MIX_STRATEGY_ROUND_ROBIN,
-        MIX_STRATEGY_SHUFFLE_SEQUENTIAL,
-        MIX_STRATEGY_STRATIFIED_RANDOM,
-    }
-)
 
 __all__ = [
     # Protocols
@@ -78,6 +59,27 @@ __all__ = [
     "build_episode_mix_node",
     "build_source_task_hierarchy",
 ]
+
+
+# Public type alias: weights can be static or epoch-dependent.
+WeightSpec = Sequence[float] | Callable[[int], Sequence[float]]
+
+# Mix strategy identifiers: ComposableSamplerConfig.mix_strategy, state_dict["type"], MixNode default names.
+MIX_STRATEGY_LARGEST_REMAINDER = "largest_remainder"
+MIX_STRATEGY_WEIGHTED_RANDOM = "weighted_random"
+MIX_STRATEGY_ROUND_ROBIN = "round_robin"
+MIX_STRATEGY_SHUFFLE_SEQUENTIAL = "shuffle_sequential"
+MIX_STRATEGY_STRATIFIED_RANDOM = "stratified_random"
+
+COMPOSABLE_MIX_STRATEGIES: frozenset[str] = frozenset(
+    {
+        MIX_STRATEGY_LARGEST_REMAINDER,
+        MIX_STRATEGY_WEIGHTED_RANDOM,
+        MIX_STRATEGY_ROUND_ROBIN,
+        MIX_STRATEGY_SHUFFLE_SEQUENTIAL,
+        MIX_STRATEGY_STRATIFIED_RANDOM,
+    }
+)
 
 
 def largest_remainder_allocate(total: int, weights: Sequence[float]) -> np.ndarray:
@@ -357,26 +359,6 @@ class StratifiedRandomStrategy:
         _ = state  # stateless
 
 
-def mix_strategy_from_name(
-    name: str,
-    *,
-    temperature: float | None = None,
-) -> MixStrategy:
-    """Build a built-in MixStrategy from a config-style name (see COMPOSABLE_MIX_STRATEGIES)."""
-    if name == MIX_STRATEGY_LARGEST_REMAINDER:
-        return LargestRemainderStrategy()
-    if name == MIX_STRATEGY_WEIGHTED_RANDOM:
-        t = 1.0 if temperature is None else float(temperature)
-        return WeightedRandomStrategy(temperature=t)
-    if name == MIX_STRATEGY_ROUND_ROBIN:
-        return RoundRobinStrategy()
-    if name == MIX_STRATEGY_SHUFFLE_SEQUENTIAL:
-        return ShuffleSequentialStrategy()
-    if name == MIX_STRATEGY_STRATIFIED_RANDOM:
-        return StratifiedRandomStrategy()
-    raise ValueError(f"Unhandled mix_strategy: {name!r}")
-
-
 _STRATEGY_REGISTRY: dict[str, Callable[[dict[str, Any]], MixStrategy]] = {
     MIX_STRATEGY_LARGEST_REMAINDER: lambda s: LargestRemainderStrategy(),
     MIX_STRATEGY_WEIGHTED_RANDOM: lambda s: WeightedRandomStrategy(temperature=float(s.get("temperature", 1.0))),
@@ -403,6 +385,20 @@ def mix_strategy_from_state(state: dict[str, Any]) -> MixStrategy:
     s = factory(state)
     s.load_state_dict(state)
     return s
+
+
+def mix_strategy_from_name(
+    name: str,
+    *,
+    temperature: float | None = None,
+) -> MixStrategy:
+    """Build a built-in MixStrategy from a config-style name (see COMPOSABLE_MIX_STRATEGIES)."""
+    if name not in COMPOSABLE_MIX_STRATEGIES:
+        raise ValueError(f"Unhandled mix_strategy: {name!r}")
+    state: dict[str, Any] = {"type": name}
+    if name == MIX_STRATEGY_WEIGHTED_RANDOM:
+        state["temperature"] = 1.0 if temperature is None else float(temperature)
+    return mix_strategy_from_state(state)
 
 
 def clone_mix_strategy(strategy: Optional[MixStrategy]) -> Optional[MixStrategy]:
