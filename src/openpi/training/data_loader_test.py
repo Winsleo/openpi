@@ -44,17 +44,15 @@ def _two_leaf_sampler(
     weights: tuple[float, float] = (0.5, 0.5),
 ) -> _config.ComposableSamplerConfig:
     """Build a 2-leaf ComposableSamplerConfig; set temperature only for weighted_random."""
-    kwargs: dict[str, Any] = {
-        "children": (_config.FakeDataConfig(), _config.FakeDataConfig()),
-        "mix_strategy": mix_strategy,
-        "weights": list(weights),
-        "seed": seed,
-        "num_samples": num_samples,
-        "shuffle_within_leaf": False,
-    }
-    if mix_strategy == _composable_sampler.MIX_STRATEGY_WEIGHTED_RANDOM:
-        kwargs["temperature"] = 1.3
-    return _config.ComposableSamplerConfig(**kwargs)
+    temperature = 1.3 if mix_strategy == _composable_sampler.MIX_STRATEGY_WEIGHTED_RANDOM else None
+    return _config.ComposableSamplerConfig(
+        children=(_config.FakeDataConfig(), _config.FakeDataConfig()),
+        mix=_config.NamedMixStrategy(name=mix_strategy, temperature=temperature),
+        weights=list(weights),
+        seed=seed,
+        num_samples=num_samples,
+        shuffle_within_leaf=False,
+    )
 
 
 def _replace_composable(
@@ -75,28 +73,22 @@ def _nested_sampler_config(
     num_samples: int,
 ) -> _config.ComposableSamplerConfig:
     """Inner (two fakes) + outer (inner + one fake) composable sampler tree."""
-    inner_kw: dict[str, Any] = {
-        "children": (_config.FakeDataConfig(), _config.FakeDataConfig()),
-        "mix_strategy": inner_mix,
-        "weights": list(inner_weights),
-        "seed": 1,
-        "shuffle_within_leaf": False,
-    }
-    if inner_temp is not None:
-        inner_kw["temperature"] = inner_temp
-    inner = _config.ComposableSamplerConfig(**inner_kw)
-
-    outer_kw: dict[str, Any] = {
-        "children": (inner, _config.FakeDataConfig()),
-        "mix_strategy": outer_mix,
-        "weights": list(outer_weights),
-        "seed": 2,
-        "num_samples": num_samples,
-        "shuffle_within_leaf": False,
-    }
-    if outer_mix == _composable_sampler.MIX_STRATEGY_WEIGHTED_RANDOM:
-        outer_kw["temperature"] = 1.0
-    return _config.ComposableSamplerConfig(**outer_kw)
+    inner = _config.ComposableSamplerConfig(
+        children=(_config.FakeDataConfig(), _config.FakeDataConfig()),
+        mix=_config.NamedMixStrategy(name=inner_mix, temperature=inner_temp),
+        weights=list(inner_weights),
+        seed=1,
+        shuffle_within_leaf=False,
+    )
+    outer_temp = 1.0 if outer_mix == _composable_sampler.MIX_STRATEGY_WEIGHTED_RANDOM else None
+    return _config.ComposableSamplerConfig(
+        children=(inner, _config.FakeDataConfig()),
+        mix=_config.NamedMixStrategy(name=outer_mix, temperature=outer_temp),
+        weights=list(outer_weights),
+        seed=2,
+        num_samples=num_samples,
+        shuffle_within_leaf=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +288,6 @@ def test_composable_sampler_via_create_data_loader(debug_config: _config.TrainCo
     """create_data_loader dispatches to composable path when composable_data is set."""
     sampler_cfg = _config.ComposableSamplerConfig(
         children=[_config.FakeDataConfig()],
-        mix_strategy=_composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER,
         num_samples=8,
         shuffle_within_leaf=False,
     )
@@ -315,7 +306,6 @@ def test_create_data_loader_composable_root_is_sampler(debug_config: _config.Tra
     """composable_data root may be a bare ComposableSamplerConfig."""
     sampler_cfg = _config.ComposableSamplerConfig(
         children=[_config.FakeDataConfig()],
-        mix_strategy=_composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER,
         num_samples=16,
         shuffle_within_leaf=False,
     )
@@ -381,7 +371,6 @@ def test_composable_data_config_inbatch(debug_config: _config.TrainConfig) -> No
 def test_composable_sampler_num_samples_below_batch_raises(debug_config: _config.TrainConfig) -> None:
     sampler_cfg = _config.ComposableSamplerConfig(
         children=[_config.FakeDataConfig()],
-        mix_strategy=_composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER,
         num_samples=1,
     )
     comp = _config.ComposableDataConfig(
@@ -397,7 +386,6 @@ def test_composable_sampler_num_samples_below_batch_raises(debug_config: _config
 def test_composable_sampler_concat_shorter_than_batch_raises(debug_config: _config.TrainConfig) -> None:
     sampler_cfg = _config.ComposableSamplerConfig(
         children=[_config.FakeDataConfig()],
-        mix_strategy=_composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER,
         num_samples=1024,
     )
     comp = _config.ComposableDataConfig(
@@ -415,7 +403,6 @@ def test_composable_sampler_shuffle_true_logs_debug(
 ) -> None:
     sampler_cfg = _config.ComposableSamplerConfig(
         children=[_config.FakeDataConfig()],
-        mix_strategy=_composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER,
         num_samples=16,
     )
     comp = _config.ComposableDataConfig(
@@ -436,28 +423,56 @@ def test_composable_sampler_shuffle_true_logs_debug(
 # ---------------------------------------------------------------------------
 
 
-def test_composable_sampler_config_temperature_only_for_weighted_random() -> None:
+def test_named_mix_strategy_temperature_only_for_weighted_random() -> None:
+    """NamedMixStrategy rejects temperature for non-weighted_random strategies."""
     with pytest.raises(ValueError, match="temperature"):
-        _config.ComposableSamplerConfig(
-            children=[_config.FakeDataConfig()],
-            mix_strategy=_composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER,
+        _config.NamedMixStrategy(
+            name=_composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER,
             temperature=1.0,
         )
 
 
+def test_named_mix_strategy_unknown_name() -> None:
+    with pytest.raises(ValueError, match="Unknown mix strategy"):
+        _config.NamedMixStrategy(name="does_not_exist")
+
+
+def test_registry_mix_strategy_unknown_quota_type() -> None:
+    with pytest.raises(ValueError, match="Unknown quota_type"):
+        _config.RegistryMixStrategy(quota_type="bad_quota", schedule_type="smooth_interleave")
+
+
+def test_registry_mix_strategy_unknown_schedule_type() -> None:
+    with pytest.raises(ValueError, match="Unknown schedule_type"):
+        _config.RegistryMixStrategy(quota_type="largest_remainder", schedule_type="bad_schedule")
+
+
+def test_leaf_traversal_config_unknown_traversal() -> None:
+    with pytest.raises(ValueError, match="Unknown traversal"):
+        _config.LeafTraversalConfig(traversal="not_a_real_traversal")
+
+
+def test_leaf_traversal_config_buffer_size_only_for_buffered_shuffle() -> None:
+    with pytest.raises(ValueError, match="buffer_size is only valid"):
+        _config.LeafTraversalConfig(
+            traversal=_composable_sampler.TRAVERSAL_PERMUTATION, buffer_size=100
+        )
+
+
+def test_leaf_traversal_config_buffered_shuffle_requires_buffer_size() -> None:
+    with pytest.raises(ValueError, match="buffer_size must be > 0"):
+        _config.LeafTraversalConfig(traversal=_composable_sampler.TRAVERSAL_BUFFERED_SHUFFLE)
+
+
 def test_composable_sampler_config_empty_children() -> None:
     with pytest.raises(ValueError, match="at least one child"):
-        _config.ComposableSamplerConfig(
-            children=(),
-            mix_strategy=_composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER,
-        )
+        _config.ComposableSamplerConfig(children=())
 
 
 def test_composable_sampler_config_weights_length_mismatch() -> None:
     with pytest.raises(ValueError, match="weights length"):
         _config.ComposableSamplerConfig(
             children=[_config.FakeDataConfig(), _config.FakeDataConfig()],
-            mix_strategy=_composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER,
             weights=[1.0],
         )
 
@@ -469,10 +484,7 @@ def test_composable_sampler_config_rejects_composable_data_child() -> None:
         weights=[1.0],
     )
     with pytest.raises(ValueError, match="ComposableDataConfig"):
-        _config.ComposableSamplerConfig(
-            children=[nested_data],
-            mix_strategy=_composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER,
-        )
+        _config.ComposableSamplerConfig(children=[nested_data])
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +521,76 @@ def test_composable_loader_determinism_same_config(debug_config: _config.TrainCo
     assert len(a) == len(b) == 3
     for x, y in zip(a, b, strict=True):
         np.testing.assert_array_equal(x, y)
+
+
+def test_composable_sampler_config_registry_mix_and_leaf_traversal_accepted() -> None:
+    """RegistryMixStrategy + LeafTraversalConfig both accepted in ComposableSamplerConfig."""
+    cfg = _config.ComposableSamplerConfig(
+        children=(_config.FakeDataConfig(), _config.FakeDataConfig()),
+        mix=_config.RegistryMixStrategy(
+            quota_type="largest_remainder",
+            schedule_type="smooth_interleave",
+        ),
+        leaf_traversal=_config.LeafTraversalConfig(
+            traversal=_composable_sampler.TRAVERSAL_AFFINE_PERMUTATION
+        ),
+        seed=1,
+        num_samples=32,
+        shuffle_within_leaf=False,
+    )
+    assert isinstance(cfg.mix, _config.RegistryMixStrategy)
+    assert cfg.mix.quota_type == "largest_remainder"
+    assert cfg.leaf_traversal is not None
+    assert cfg.leaf_traversal.traversal == _composable_sampler.TRAVERSAL_AFFINE_PERMUTATION
+
+
+def test_mix_strategy_from_sampler_config_named_vs_registry() -> None:
+    named = _config.ComposableSamplerConfig(
+        children=(_config.FakeDataConfig(), _config.FakeDataConfig()),
+        mix=_config.NamedMixStrategy(name=_composable_sampler.MIX_STRATEGY_ROUND_ROBIN),
+        seed=0,
+        num_samples=8,
+    )
+    s_named = _data_loader._mix_strategy_from_sampler_config(named)
+    s_ref = _composable_sampler.mix_strategy_from_name(
+        _composable_sampler.MIX_STRATEGY_ROUND_ROBIN, temperature=None
+    )
+    assert type(s_named) is type(s_ref)
+
+    reg = _config.ComposableSamplerConfig(
+        children=(_config.FakeDataConfig(), _config.FakeDataConfig()),
+        mix=_config.RegistryMixStrategy(
+            quota_type="largest_remainder", schedule_type="smooth_interleave"
+        ),
+        seed=0,
+        num_samples=8,
+    )
+    s_reg = _data_loader._mix_strategy_from_sampler_config(reg)
+    s_reg_ref = _composable_sampler.mix_strategy_from_registry(
+        quota_type="largest_remainder", schedule_type="smooth_interleave"
+    )
+    assert type(s_reg) is type(s_reg_ref)
+
+
+def test_dfs_sampler_factories_propagates_leaf_traversal_config() -> None:
+    inner = _config.ComposableSamplerConfig(
+        children=(_config.FakeDataConfig(),),
+        seed=10,
+        num_samples=4,
+        leaf_traversal=_config.LeafTraversalConfig(traversal=_composable_sampler.TRAVERSAL_PERMUTATION),
+    )
+    root = _config.ComposableSamplerConfig(
+        children=(inner, _config.FakeDataConfig()),
+        seed=20,
+        num_samples=8,
+        leaf_traversal=_config.LeafTraversalConfig(traversal=_composable_sampler.TRAVERSAL_AFFINE_PERMUTATION),
+    )
+    entries = _data_loader._dfs_sampler_factories(root)
+    assert len(entries) == 2
+    lt0 = entries[0][-1]
+    assert lt0 is not None and lt0.traversal == _composable_sampler.TRAVERSAL_PERMUTATION
+    lt1 = entries[1][-1]
+    assert lt1 is not None and lt1.traversal == _composable_sampler.TRAVERSAL_AFFINE_PERMUTATION
 
 
 # ---------------------------------------------------------------------------

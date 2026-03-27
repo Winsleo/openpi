@@ -863,10 +863,16 @@ def _torch_dataset_from_factory(
     return ds, data_config
 
 
-# Each leaf entry carries: factory, shuffle_within_leaf from its direct parent, and
-# the local index of this leaf within that parent (used for stable per-parent seed derivation).
-LeafEntry = tuple[_config.DataConfigFactory, bool, int | None, int]
-# fields: (factory, shuffle_within_leaf, parent_seed, local_idx_in_parent)
+# Each leaf entry carries: factory, shuffle_within_leaf, parent_seed, local_idx_in_parent,
+# and the LeafTraversalConfig (or None) from its direct parent.
+LeafEntry = tuple[
+    _config.DataConfigFactory,
+    bool,
+    int | None,
+    int,
+    "_config.LeafTraversalConfig | None",
+]
+# fields: (factory, shuffle_within_leaf, parent_seed, local_idx_in_parent, leaf_traversal)
 
 
 def _dfs_sampler_factories(
@@ -874,20 +880,30 @@ def _dfs_sampler_factories(
 ) -> list[LeafEntry]:
     """DFS leaf order.
 
-    Returns a flat list of (factory, shuffle_within_leaf, parent_seed, local_idx_in_parent)
-    so that each leaf's seed can be derived from its direct parent's seed and its
+    Returns a flat list so each leaf's seed can be derived from its direct parent's seed and its
     position within that parent, independent of the global DFS order.
     """
     out: list[LeafEntry] = []
     local_idx = 0
     for child in node.children:
         if isinstance(child, _config.DataConfigFactory):
-            out.append((child, node.shuffle_within_leaf, node.seed, local_idx))
+            out.append((child, node.shuffle_within_leaf, node.seed, local_idx, node.leaf_traversal))
             local_idx += 1
         else:
             out.extend(_dfs_sampler_factories(child))
             local_idx += 1
     return out
+
+
+def _mix_strategy_from_sampler_config(
+    cfg: _config.ComposableSamplerConfig,
+) -> _composable_sampler.MixStrategy:
+    mix = cfg.mix
+    if isinstance(mix, _config.RegistryMixStrategy):
+        return _composable_sampler.mix_strategy_from_registry(
+            quota_type=mix.quota_type, schedule_type=mix.schedule_type
+        )
+    return _composable_sampler.mix_strategy_from_name(mix.name, temperature=mix.temperature)
 
 
 def _build_mix_node_tree(
@@ -908,7 +924,7 @@ def _build_mix_node_tree(
             children_sn.append(next(leaf_iter))
         else:
             children_sn.append(_build_mix_node_tree(child, leaf_iter, depth + 1))
-    strategy = _composable_sampler.mix_strategy_from_name(cfg.mix_strategy, temperature=cfg.temperature)
+    strategy = _mix_strategy_from_sampler_config(cfg)
     w = list(cfg.weights) if cfg.weights is not None else [1.0] * len(children_sn)
     return _composable_sampler.MixNode(
         children=children_sn,
@@ -945,7 +961,7 @@ def _build_from_composable_sampler_config(
     datasets: list[torch.utils.data.Dataset] = []
     data_configs: list[_config.DataConfig] = []
     primary_dc: _config.DataConfig | None = None
-    for factory, _shuffle_leaf, _parent_seed, _local_idx in leaf_entries:
+    for factory, _shuffle_leaf, _parent_seed, _local_idx, _lt in leaf_entries:
         ds, dc = _torch_dataset_from_factory(config, factory, skip_norm_stats=skip_norm_stats)
         datasets.append(ds)
         data_configs.append(dc)
@@ -956,20 +972,33 @@ def _build_from_composable_sampler_config(
     concat_ds = torch.utils.data.ConcatDataset(datasets)
     off = 0
     leaf_nodes: list[_composable_sampler.LeafNode] = []
-    for i, (dc, ds, (_, shuffle_leaf, parent_seed, local_idx)) in enumerate(
-        zip(data_configs, datasets, leaf_entries)
-    ):
+    for i, (dc, ds, leaf_entry) in enumerate(zip(data_configs, datasets, leaf_entries)):
+        _, shuffle_leaf, parent_seed, local_idx, lt_cfg = leaf_entry
         ln_seed = None if parent_seed is None else int(parent_seed) + local_idx * 10_007
         L = len(ds)
-        leaf_nodes.append(
-            _composable_sampler.LeafNode(
-                length=int(L),
-                offset=int(off),
-                shuffle=shuffle_leaf,
-                seed=ln_seed,
-                name=str(dc.repo_id) if dc.repo_id is not None else f"leaf_{i}",
+        leaf_name = str(dc.repo_id) if dc.repo_id is not None else f"leaf_{i}"
+        if lt_cfg is None:
+            leaf_nodes.append(
+                _composable_sampler.LeafNode(
+                    length=int(L),
+                    offset=int(off),
+                    shuffle=shuffle_leaf,
+                    seed=ln_seed,
+                    name=leaf_name,
+                )
             )
-        )
+        else:
+            leaf_nodes.append(
+                _composable_sampler.Compose.leaf(
+                    int(L),
+                    int(off),
+                    traversal=lt_cfg.traversal,
+                    shuffle=shuffle_leaf,
+                    seed=ln_seed,
+                    buffer_size=lt_cfg.buffer_size,
+                    name=leaf_name,
+                )
+            )
         off += int(L)
 
     leaf_iter = iter(leaf_nodes)
@@ -1005,9 +1034,16 @@ def _build_from_composable_sampler_config(
         framework=framework,
     )
     indent = "  " * _depth
+    mix = node.mix
+    if isinstance(mix, _config.RegistryMixStrategy):
+        mix_desc = f"mix=RegistryMixStrategy({mix.quota_type!r}, {mix.schedule_type!r})"
+    else:
+        mix_desc = f"mix=NamedMixStrategy({mix.name!r})"
+    lt = node.leaf_traversal
+    leaf_desc = f", leaf_traversal={lt.traversal!r}" if lt is not None else ""
     logging.info(
-        f"{indent}  +-- ComposableSampler(leaves={len(leaf_nodes)}, strategy={node.mix_strategy}, "
-        f"num_samples={num_samples})"
+        f"{indent}  +-- ComposableSampler(leaves={len(leaf_nodes)}, "
+        f"{mix_desc}{leaf_desc}, num_samples={num_samples})"
     )
     return DataLoaderImpl(primary_dc, inner, pack_as_observation=False), primary_dc
 
