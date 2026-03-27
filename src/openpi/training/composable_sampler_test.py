@@ -230,11 +230,11 @@ def test_compose_and_from_dataset_lengths_and_len() -> None:
         leaf.set_epoch(0)
 
     nodes = [
-        _sampler.Compose.largest_remainder(leaves, weights=[0.5, 0.3, 0.2], seed=1),
-        _sampler.Compose.weighted_random(leaves, weights=[0.5, 0.3, 0.2], temperature=1.2, seed=1),
-        _sampler.Compose.round_robin(leaves, weights=[0.5, 0.3, 0.2], seed=1),
-        _sampler.Compose.shuffle_sequential(leaves, weights=[0.5, 0.3, 0.2], seed=1),
-        _sampler.Compose.stratified_random(leaves, weights=[0.5, 0.3, 0.2], seed=1),
+        _sampler.Compose.mix(leaves, weights=[0.5, 0.3, 0.2], strategy="largest_remainder", seed=1),
+        _sampler.Compose.mix(leaves, weights=[0.5, 0.3, 0.2], strategy="weighted_random", temperature=1.2, seed=1),
+        _sampler.Compose.mix(leaves, weights=[0.5, 0.3, 0.2], strategy="round_robin", seed=1),
+        _sampler.Compose.mix(leaves, weights=[0.5, 0.3, 0.2], strategy="shuffle_sequential", seed=1),
+        _sampler.Compose.mix(leaves, weights=[0.5, 0.3, 0.2], strategy="stratified_random", seed=1),
     ]
     for node in nodes:
         node.set_epoch(0)
@@ -257,12 +257,44 @@ def test_compose_and_from_dataset_lengths_and_len() -> None:
     assert len(list(iter(sampler_custom))) == 17
 
 
-def test_builder_helpers_with_custom_strategies() -> None:
+def test_registry_introspection_includes_builtins() -> None:
+    assert _sampler.TRAVERSAL_PERMUTATION in _sampler.registered_traversal_policy_types()
+    assert _sampler.MIX_STRATEGY_LARGEST_REMAINDER in _sampler.registered_mix_strategy_types()
+    assert "largest_remainder" in _sampler.registered_quota_allocator_types()
+    assert "smooth_interleave" in _sampler.registered_schedule_policy_types()
+
+
+def test_compose_sampler_and_flat() -> None:
+    leaves = _make_leaves((10, 10, 10))
+    root = _sampler.Compose.mix(leaves, seed=0)
+    s1 = _sampler.Compose.sampler(root, 30)
+    s2 = _sampler.Compose.flat([10, 10, 10], num_samples=30, seed=0)
+    assert len(s1) == 30
+    assert len(s2) == 30
+
+
+def test_compose_episodes_registry_mix_and_traversal() -> None:
+    episodes = [
+        _sampler.EpisodeSpec(length=4, offset=0, weight=1.0),
+        _sampler.EpisodeSpec(length=4, offset=4, weight=1.0),
+    ]
+    node = _sampler.Compose.episodes(
+        episodes,
+        seed=1,
+        strategy=_sampler.MIX_STRATEGY_ROUND_ROBIN,
+        traversal=_sampler.TRAVERSAL_PERMUTATION,
+        shuffle=False,
+    )
+    node.set_epoch(0)
+    assert len(list(node.plan(8))) == 8
+
+
+def test_compose_episodes_and_hierarchy_custom_strategies() -> None:
     episodes = [
         _sampler.EpisodeSpec(length=5, offset=0, weight=1.0, name="ep0"),
         _sampler.EpisodeSpec(length=5, offset=5, weight=1.0, name="ep1"),
     ]
-    ep_mix = _sampler.build_episode_mix_node(
+    ep_mix = _sampler.Compose.episodes(
         episodes,
         seed=7,
         strategy=_sampler.RoundRobinStrategy(),
@@ -271,7 +303,7 @@ def test_builder_helpers_with_custom_strategies() -> None:
     ep_mix.set_epoch(0)
     assert len(list(ep_mix.plan(8))) == 8
 
-    root = _sampler.build_source_task_hierarchy(
+    root = _sampler.Compose.hierarchy(
         {
             "s1": {"t1": [_sampler.EpisodeSpec(length=6, offset=0)]},
             "s2": {"t2": [_sampler.EpisodeSpec(length=6, offset=6)]},
@@ -393,16 +425,18 @@ def test_nested_compose_source_distribution_sanity() -> None:
     for leaf in leaves:
         leaf.set_epoch(0)
 
-    inner = _sampler.Compose.weighted_random(
+    inner = _sampler.Compose.mix(
         leaves[:2],
         weights=[0.7, 0.3],
+        strategy="weighted_random",
         temperature=1.0,
         seed=100,
         name="inner",
     )
-    root = _sampler.Compose.round_robin(
+    root = _sampler.Compose.mix(
         [inner, leaves[2]],
         weights=[0.8, 0.2],
+        strategy="round_robin",
         seed=101,
         name="root",
     )
