@@ -528,43 +528,127 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class NamedMixStrategy:
+    """One of the five built-in named mix strategies.
+
+    ``name`` must be a key in :data:`composable_sampler.COMPOSABLE_MIX_STRATEGIES`.
+    ``temperature`` is only valid for ``weighted_random`` and must be > 0.
+    """
+
+    name: str = _composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER
+    temperature: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.name not in _composable_sampler.COMPOSABLE_MIX_STRATEGIES:
+            raise ValueError(
+                f"Unknown mix strategy name {self.name!r}; "
+                f"expected one of {sorted(_composable_sampler.COMPOSABLE_MIX_STRATEGIES)}"
+            )
+        if self.temperature is not None:
+            if self.name != _composable_sampler.MIX_STRATEGY_WEIGHTED_RANDOM:
+                raise ValueError(
+                    f"temperature is only valid when name={_composable_sampler.MIX_STRATEGY_WEIGHTED_RANDOM!r}"
+                )
+            if self.temperature <= 0:
+                raise ValueError("temperature must be > 0")
+
+
+@dataclasses.dataclass(frozen=True)
+class RegistryMixStrategy:
+    """Composite mix strategy built from independent quota allocator x schedule policy.
+
+    Both ``quota_type`` and ``schedule_type`` must be registered keys; see
+    :data:`composable_sampler.COMPOSABLE_QUOTA_ALLOCATOR_TYPES` and
+    :data:`composable_sampler.COMPOSABLE_SCHEDULE_POLICY_TYPES`.
+    """
+
+    quota_type: str
+    schedule_type: str
+
+    def __post_init__(self) -> None:
+        if self.quota_type not in _composable_sampler.registered_quota_allocator_types():
+            raise ValueError(
+                f"Unknown quota_type {self.quota_type!r}; "
+                f"expected one of {sorted(_composable_sampler.registered_quota_allocator_types())}"
+            )
+        if self.schedule_type not in _composable_sampler.registered_schedule_policy_types():
+            raise ValueError(
+                f"Unknown schedule_type {self.schedule_type!r}; "
+                f"expected one of {sorted(_composable_sampler.registered_schedule_policy_types())}"
+            )
+
+
+# Union type for the ``mix`` field of ``ComposableSamplerConfig``.
+MixStrategyConfig = Union[NamedMixStrategy, RegistryMixStrategy]
+
+
+@dataclasses.dataclass(frozen=True)
+class LeafTraversalConfig:
+    """Leaf traversal policy for datasets directly under a ``ComposableSamplerConfig`` node.
+
+    ``traversal`` must be a key in :data:`composable_sampler.COMPOSABLE_TRAVERSAL_POLICIES`.
+    ``buffer_size`` is required (and must be > 0) when ``traversal`` is ``"buffered_shuffle"``,
+    and must not be set otherwise.
+    """
+
+    traversal: str
+    buffer_size: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.traversal not in _composable_sampler.registered_traversal_policy_types():
+            raise ValueError(
+                f"Unknown traversal {self.traversal!r}; "
+                f"expected one of {sorted(_composable_sampler.registered_traversal_policy_types())}"
+            )
+        if self.traversal == _composable_sampler.TRAVERSAL_BUFFERED_SHUFFLE:
+            if self.buffer_size is None or self.buffer_size <= 0:
+                raise ValueError(
+                    f"buffer_size must be > 0 when traversal={_composable_sampler.TRAVERSAL_BUFFERED_SHUFFLE!r}"
+                )
+        elif self.buffer_size is not None:
+            raise ValueError(
+                f"buffer_size is only valid when traversal={_composable_sampler.TRAVERSAL_BUFFERED_SHUFFLE!r}"
+            )
+
+
+@dataclasses.dataclass(frozen=True)
 class ComposableSamplerConfig:
     """Index-level mixing: ``ConcatDataset`` over all leaf datasets + nested ``MixNode`` tree.
 
     Children may be ``DataConfigFactory`` leaves or nested ``ComposableSamplerConfig``
     (each defines a sub-mix group). Leaf datasets are built in depth-first order and
     assigned contiguous global indices; the sampler tree mirrors this config tree.
+
+    **Per-node mix strategy** (each nested ``ComposableSamplerConfig`` is one ``MixNode``):
+
+    - :class:`NamedMixStrategy` - one of the five built-in named strategies, optionally with
+      ``temperature`` for ``weighted_random``.
+    - :class:`RegistryMixStrategy` - any combination of a quota allocator and a schedule policy
+      from their respective registries.
+
+    **Per-node leaf traversal** (applies to dataset leaves whose *direct parent* is this node):
+
+    - ``leaf_traversal=None`` - use default shuffled permutation (controlled by ``shuffle_within_leaf``).
+    - ``leaf_traversal=LeafTraversalConfig(traversal=...)`` - explicit traversal type; for
+      ``"buffered_shuffle"`` also set ``buffer_size``.
     """
 
     children: Sequence[Union[DataConfigFactory, "ComposableSamplerConfig"]] = ()
 
-    mix_strategy: str = _composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER
+    mix: MixStrategyConfig = dataclasses.field(default_factory=NamedMixStrategy)
     weights: Sequence[float] | None = None
     seed: int | None = None
     num_samples: int | None = None
     shuffle_within_leaf: bool = True
-    temperature: float | None = None
+    leaf_traversal: "LeafTraversalConfig | None" = None
 
     def __post_init__(self) -> None:
         if not self.children:
             raise ValueError("ComposableSamplerConfig must have at least one child")
-        if self.mix_strategy not in _composable_sampler.COMPOSABLE_MIX_STRATEGIES:
-            raise ValueError(
-                f"Unknown mix_strategy {self.mix_strategy!r}; "
-                f"expected one of {sorted(_composable_sampler.COMPOSABLE_MIX_STRATEGIES)}"
-            )
         if self.weights is not None and len(self.weights) != len(self.children):
             raise ValueError(
                 f"weights length ({len(self.weights)}) must match children length ({len(self.children)})"
             )
-        if self.temperature is not None:
-            if self.mix_strategy != _composable_sampler.MIX_STRATEGY_WEIGHTED_RANDOM:
-                raise ValueError(
-                    "temperature is only used when mix_strategy is "
-                    f"{_composable_sampler.MIX_STRATEGY_WEIGHTED_RANDOM!r}"
-                )
-            if self.temperature <= 0:
-                raise ValueError("temperature must be > 0")
         for i, c in enumerate(self.children):
             if isinstance(c, ComposableDataConfig):
                 raise ValueError(
@@ -1070,8 +1154,7 @@ _CONFIGS = [
                             ),
                             base_config=DataConfig(
                                 prompt_from_task=True,
-                                num_batches=6,
-                                episodes_index=list(range(100)),
+                                episodes_index=list(range(1)),
                                 behavior_dataset_root="/data/behavior-1k/2025-challenge-demos",
                             ),
                         ),
@@ -1083,15 +1166,16 @@ _CONFIGS = [
                             ),
                             base_config=DataConfig(
                                 prompt_from_task=True,
-                                num_batches=4,
-                                episodes_index=list(range(100, 190)),
+                                episodes_index=list(range(100, 101)),
                                 behavior_dataset_root="/data/behavior-1k/2025-challenge-demos",
                             ),
                         ),
                     ],
-                    mix_strategy=_composable_sampler.MIX_STRATEGY_WEIGHTED_RANDOM,
+                    mix=NamedMixStrategy(
+                        name="weighted_random",
+                        temperature=1.0,
+                    ),
                     weights=[0.6, 0.4],
-                    temperature=1.0,
                     seed=11,
                 ),
                 LeRobotB1KDataConfig(
@@ -1102,16 +1186,15 @@ _CONFIGS = [
                     ),
                     base_config=DataConfig(
                         prompt_from_task=True,
-                        num_batches=5,
-                        episodes_index=list(range(50)),
+                        episodes_index=list(range(2, 3)),
                         behavior_dataset_root="/data/behavior-1k/2025-challenge-demos",
                     ),
                 ),
             ],
-            mix_strategy=_composable_sampler.MIX_STRATEGY_LARGEST_REMAINDER,
+            mix=NamedMixStrategy(name="largest_remainder"),
             weights=[2.0, 1.0],
             seed=22,
-            num_samples=None,
+            # num_samples=10000,
             shuffle_within_leaf=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/model/pi05_base/params"),
