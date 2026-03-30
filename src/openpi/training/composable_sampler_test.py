@@ -261,7 +261,18 @@ def test_registry_introspection_includes_builtins() -> None:
     assert _sampler.TRAVERSAL_PERMUTATION in _sampler.registered_traversal_policy_types()
     assert _sampler.MIX_STRATEGY_LARGEST_REMAINDER in _sampler.registered_mix_strategy_types()
     assert "largest_remainder" in _sampler.registered_quota_allocator_types()
-    assert "smooth_interleave" in _sampler.registered_schedule_policy_types()
+    assert "proportional_random" in _sampler.registered_quota_scheduler_types()
+    assert "smooth_interleave" in _sampler.registered_quota_scheduler_types()
+
+
+def test_custom_mix_strategy_accepts_quota_scheduler_keyword() -> None:
+    strategy = _sampler.custom_mix_strategy(
+        quota_allocator=_sampler.LargestRemainderAllocator(),
+        quota_scheduler=_sampler.SmoothInterleaveSchedule(),
+    )
+
+    assert isinstance(strategy, _sampler.CompositeMixStrategy)
+    assert isinstance(strategy.quota_scheduler, _sampler.SmoothInterleaveSchedule)
 
 
 def test_compose_sampler_and_flat() -> None:

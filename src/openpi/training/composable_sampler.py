@@ -39,13 +39,33 @@ Typical usage::
 
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional, Protocol, Sequence
-import heapq
 import math
 
 import numpy as np
 from torch.utils.data import Sampler
 
-from openpi.training.composable_dataloader import normalize_weights
+from openpi.training.mixing import (
+    COMPOSABLE_QUOTA_ALLOCATOR_TYPES,
+    COMPOSABLE_QUOTA_SCHEDULER_TYPES,
+    QuotaAllocator,
+    QuotaScheduler,
+    LargestRemainderAllocator,
+    MultinomialAllocator,
+    SmoothInterleaveSchedule,
+    RandomShuffleSchedule,
+    RoundRobinSchedule,
+    ShuffleSequentialSchedule,
+    StratifiedRandomSchedule,
+    quota_allocator_from_registry,
+    quota_scheduler_from_registry,
+    restore_quota_and_schedule,
+    register_quota_allocator,
+    register_quota_scheduler,
+    registered_quota_allocator_types,
+    registered_quota_scheduler_types,
+    largest_remainder_allocate,
+    normalize_weights,
+)
 
 
 __all__ = [
@@ -99,13 +119,15 @@ __all__ = [
     "clone_traversal",
     "register_strategy",
     "register_traversal_policy",
-    "SmoothQuotaInterleaver",
     "QuotaAllocator",
-    "SchedulePolicy",
+    "QuotaScheduler",
+    "COMPOSABLE_QUOTA_SCHEDULER_TYPES",
+    "quota_scheduler_from_registry",
+    "registered_quota_scheduler_types",
     "mix_strategy_from_registry",
     "traversal_from_registry",
     "register_quota_allocator",
-    "register_schedule_policy",
+    "register_quota_scheduler",
 ]
 
 
@@ -146,22 +168,6 @@ COMPOSABLE_MIX_STRATEGIES: frozenset[str] = frozenset({
 # Utility
 # ============================================================
 
-def largest_remainder_allocate(total: int, weights: Sequence[float]) -> np.ndarray:
-    """Allocate integer quotas summing exactly to *total* (Hamilton / Largest-Remainder method)."""
-    if total < 0:
-        raise ValueError("total must be >= 0")
-    w = normalize_weights(weights)
-    raw = w * float(total)
-    base = np.floor(raw).astype(np.int64)
-    remain = int(total - int(base.sum()))
-    if remain == 0:
-        return base
-    frac = raw - base
-    order = np.lexsort((np.arange(len(frac)), -frac))
-    base[order[:remain]] += 1
-    return base
-
-
 def seed_to_rng(seed: Optional[int]) -> np.random.Generator:
     return np.random.default_rng(seed)
 
@@ -169,37 +175,6 @@ def seed_to_rng(seed: Optional[int]) -> np.random.Generator:
 def _epoch_rng(base_seed: Optional[int], epoch: int) -> np.random.Generator:
     """Derive a per-epoch RNG from a base seed (centralises the ternary pattern)."""
     return seed_to_rng(None if base_seed is None else base_seed + epoch)
-
-
-# ============================================================
-# SmoothQuotaInterleaver (public utility, used by strategies)
-# ============================================================
-
-class SmoothQuotaInterleaver:
-    """Interleave child streams so each stays as close to its quota fraction as possible."""
-
-    def interleave(
-        self,
-        streams: Sequence[Iterator[int]],
-        quotas: np.ndarray | Sequence[int],
-    ) -> Iterator[int]:
-        q = np.asarray(quotas, dtype=np.int64)
-        total = int(q.sum())
-        if total == 0:
-            return
-        consumed = np.zeros(len(q), dtype=np.int64)
-        heap: list[tuple[float, int]] = []
-        for i, qi in enumerate(q):
-            if qi > 0:
-                heapq.heappush(heap, (0.0, i))
-        for _ in range(total):
-            if not heap:
-                return
-            _, i = heapq.heappop(heap)
-            yield next(streams[i])
-            consumed[i] += 1
-            if consumed[i] < q[i]:
-                heapq.heappush(heap, (consumed[i] / float(q[i]), i))
 
 
 # ============================================================
@@ -213,38 +188,10 @@ class SamplerNode(Protocol):
     def load_state_dict(self, state: dict[str, Any]) -> None: ...
 
 
-class QuotaAllocator(Protocol):
-    """Public protocol: allocate integer quotas for child nodes."""
-
-    def allocate(
-        self,
-        weights: np.ndarray,
-        budget: int,
-        rng: np.random.Generator,
-    ) -> np.ndarray: ...
-
-    def state_dict(self) -> dict[str, Any]: ...
-    def load_state_dict(self, state: dict[str, Any]) -> None: ...
-
-
-class SchedulePolicy(Protocol):
-    """Public protocol: consume child streams according to already computed quotas."""
-
-    def schedule(
-        self,
-        streams: Sequence[Iterator[int]],
-        quotas: np.ndarray,
-        rng: np.random.Generator,
-    ) -> Iterator[int]: ...
-
-    def state_dict(self) -> dict[str, Any]: ...
-    def load_state_dict(self, state: dict[str, Any]) -> None: ...
-
-
 class MixStrategy(Protocol):
     """How a MixNode distributes a budget across children and orders their output.
 
-    Named implementations compose QuotaAllocator + SchedulePolicy; typical use is a
+    Named implementations compose QuotaAllocator + QuotaScheduler; typical use is a
     *Strategy class, mix_strategy_from_name, or MixNode(..., strategy=...).
     """
 
@@ -270,222 +217,6 @@ class TraversalPolicy(Protocol):
 
 
 # ============================================================
-# Quota allocators and schedule policies (CompositeMixStrategy building blocks)
-# ============================================================
-
-class LargestRemainderAllocator:
-    def allocate(self, weights: np.ndarray, budget: int, rng: np.random.Generator) -> np.ndarray:
-        return largest_remainder_allocate(int(budget), weights)
-
-    def state_dict(self) -> dict[str, Any]:
-        return {"type": "largest_remainder"}
-
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        pass
-
-
-class MultinomialAllocator:
-    def __init__(self, *, temperature: float = 1.0) -> None:
-        if temperature <= 0:
-            raise ValueError("temperature must be > 0")
-        self.temperature = float(temperature)
-
-    def allocate(self, weights: np.ndarray, budget: int, rng: np.random.Generator) -> np.ndarray:
-        probs = np.asarray(weights, dtype=np.float64)
-        if self.temperature != 1.0:
-            probs = probs ** (1.0 / self.temperature)
-            total = probs.sum()
-            if total <= 0:
-                raise ValueError("scaled weights must not all be zero")
-            probs = probs / total
-        return rng.multinomial(int(budget), probs)
-
-    def state_dict(self) -> dict[str, Any]:
-        return {"type": "multinomial", "temperature": self.temperature}
-
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        self.temperature = float(state.get("temperature", 1.0))
-
-
-class SmoothInterleaveSchedule:
-    """SchedulePolicy adapter: smooth interleaving via SmoothQuotaInterleaver (type: smooth_interleave)."""
-
-    def __init__(self) -> None:
-        self._interleaver = SmoothQuotaInterleaver()
-
-    def schedule(self, streams: Sequence[Iterator[int]], quotas: np.ndarray, rng: np.random.Generator) -> Iterator[int]:
-        _ = rng
-        yield from self._interleaver.interleave(streams, quotas)
-
-    def state_dict(self) -> dict[str, Any]:
-        return {"type": "smooth_interleave"}
-
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        pass
-
-
-class RandomShuffleSchedule:
-    def schedule(self, streams: Sequence[Iterator[int]], quotas: np.ndarray, rng: np.random.Generator) -> Iterator[int]:
-        q = np.asarray(quotas, dtype=np.int64)
-        order = np.repeat(np.arange(len(q), dtype=np.int64), q)
-        rng.shuffle(order)
-        for i in order:
-            yield next(streams[int(i)])
-
-    def state_dict(self) -> dict[str, Any]:
-        return {"type": "random_shuffle"}
-
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        pass
-
-
-class RoundRobinSchedule:
-    def schedule(self, streams: Sequence[Iterator[int]], quotas: np.ndarray, rng: np.random.Generator) -> Iterator[int]:
-        remaining = np.asarray(quotas, dtype=np.int64).copy()
-        active = [i for i, q in enumerate(remaining) if int(q) > 0]
-        pos = 0
-        for _ in range(int(remaining.sum())):
-            if not active:
-                break
-            idx = int(active[pos])
-            yield next(streams[idx])
-            remaining[idx] -= 1
-            if int(remaining[idx]) <= 0:
-                active.pop(pos)
-                if not active:
-                    break
-                if pos >= len(active):
-                    pos = 0
-            else:
-                pos = (pos + 1) % len(active)
-
-    def state_dict(self) -> dict[str, Any]:
-        return {"type": "round_robin"}
-
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        pass
-
-
-class ShuffleSequentialSchedule:
-    def schedule(self, streams: Sequence[Iterator[int]], quotas: np.ndarray, rng: np.random.Generator) -> Iterator[int]:
-        order = rng.permutation(len(streams))
-        for i in order:
-            yield from streams[int(i)]
-
-    def state_dict(self) -> dict[str, Any]:
-        return {"type": "shuffle_sequential"}
-
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        pass
-
-
-class StratifiedRandomSchedule:
-    def schedule(self, streams: Sequence[Iterator[int]], quotas: np.ndarray, rng: np.random.Generator) -> Iterator[int]:
-        remaining = np.asarray(quotas, dtype=np.int64).copy()
-        left = int(remaining.sum())
-        while left > 0:
-            active = np.where(remaining > 0)[0]
-            for i in rng.permutation(active):
-                ii = int(i)
-                yield next(streams[ii])
-                remaining[ii] -= 1
-                left -= 1
-                if left <= 0:
-                    return
-
-    def state_dict(self) -> dict[str, Any]:
-        return {"type": "stratified_random"}
-
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        pass
-
-
-# Helper functions to reconstruct allocator/schedule from legacy state dicts.
-_QUOTA_ALLOCATOR_FROM_STATE: dict[str, Callable[[dict], QuotaAllocator]] = {
-    "largest_remainder": lambda s: LargestRemainderAllocator(),
-    "multinomial": lambda s: MultinomialAllocator(temperature=float(s.get("temperature", 1.0))),
-}
-_SCHEDULE_POLICY_FROM_STATE: dict[str, Callable[[dict], SchedulePolicy]] = {
-    "smooth_interleave": lambda s: SmoothInterleaveSchedule(),
-    "random_shuffle":    lambda s: RandomShuffleSchedule(),
-    "round_robin":       lambda s: RoundRobinSchedule(),
-    "shuffle_sequential":lambda s: ShuffleSequentialSchedule(),
-    "stratified_random": lambda s: StratifiedRandomSchedule(),
-}
-
-
-def register_quota_allocator(
-    type_name: str,
-    factory: Callable[[dict[str, Any]], QuotaAllocator],
-) -> None:
-    """Register a custom QuotaAllocator factory for state restoration."""
-    _QUOTA_ALLOCATOR_FROM_STATE[type_name] = factory  # type: ignore[assignment]
-
-
-def register_schedule_policy(
-    type_name: str,
-    factory: Callable[[dict[str, Any]], SchedulePolicy],
-) -> None:
-    """Register a custom SchedulePolicy factory for state restoration."""
-    _SCHEDULE_POLICY_FROM_STATE[type_name] = factory  # type: ignore[assignment]
-
-
-COMPOSABLE_QUOTA_ALLOCATOR_TYPES: frozenset[str] = frozenset(_QUOTA_ALLOCATOR_FROM_STATE.keys())
-COMPOSABLE_SCHEDULE_POLICY_TYPES: frozenset[str] = frozenset(_SCHEDULE_POLICY_FROM_STATE.keys())
-
-
-def quota_allocator_from_registry(
-    type_name: str,
-    state: Optional[dict[str, Any]] = None,
-    *,
-    temperature: Optional[float] = None,
-) -> QuotaAllocator:
-    """Instantiate a :class:`QuotaAllocator` from a :data:`COMPOSABLE_QUOTA_ALLOCATOR_TYPES` key.
-
-    Extra fields (e.g. ``temperature`` for ``multinomial``) go in *state* or as *temperature*.
-    """
-    if type_name not in _QUOTA_ALLOCATOR_FROM_STATE:
-        raise ValueError(
-            f"unknown quota allocator type: {type_name!r}; "
-            f"registered: {sorted(registered_quota_allocator_types())}"
-        )
-    merged: dict[str, Any] = {"type": type_name, **(state or {})}
-    if temperature is not None:
-        merged["temperature"] = float(temperature)
-    factory = _QUOTA_ALLOCATOR_FROM_STATE[type_name]
-    qa = factory(merged)
-    qa.load_state_dict(merged)
-    return qa
-
-
-def schedule_policy_from_registry(
-    type_name: str,
-    state: Optional[dict[str, Any]] = None,
-) -> SchedulePolicy:
-    """Instantiate a :class:`SchedulePolicy` from a :data:`COMPOSABLE_SCHEDULE_POLICY_TYPES` key."""
-    if type_name not in _SCHEDULE_POLICY_FROM_STATE:
-        raise ValueError(
-            f"unknown schedule policy type: {type_name!r}; "
-            f"registered: {sorted(registered_schedule_policy_types())}"
-        )
-    merged: dict[str, Any] = {"type": type_name, **(state or {})}
-    factory = _SCHEDULE_POLICY_FROM_STATE[type_name]
-    sp = factory(merged)
-    sp.load_state_dict(merged)
-    return sp
-
-
-def registered_quota_allocator_types() -> frozenset[str]:
-    """Keys currently in the quota-allocator registry (includes :func:`register_quota_allocator` adds)."""
-    return frozenset(_QUOTA_ALLOCATOR_FROM_STATE.keys())
-
-
-def registered_schedule_policy_types() -> frozenset[str]:
-    """Keys currently in the schedule-policy registry (includes :func:`register_schedule_policy` adds)."""
-    return frozenset(_SCHEDULE_POLICY_FROM_STATE.keys())
-
-
-# ============================================================
 # Public MixStrategy implementations
 # ============================================================
 
@@ -493,7 +224,7 @@ class BaseMixStrategy:
     """Internal base: implements plan() via an allocator + scheduler pair."""
 
     _allocator: QuotaAllocator
-    _scheduler: SchedulePolicy
+    _scheduler: QuotaScheduler
 
     def plan(
         self,
@@ -511,58 +242,66 @@ class BaseMixStrategy:
 
 
 class CompositeMixStrategy(BaseMixStrategy):
-    """Public advanced MixStrategy built from a QuotaAllocator + SchedulePolicy.
+    """Public advanced MixStrategy built from a QuotaAllocator + QuotaScheduler.
 
     This preserves the simple named wrappers for common use, while enabling
     custom mixing behaviour without exposing MixNode internals.
     """
 
-    def __init__(self, *, quota_allocator: QuotaAllocator, schedule_policy: SchedulePolicy) -> None:
+    def __init__(
+        self,
+        *,
+        quota_allocator: QuotaAllocator,
+        quota_scheduler: QuotaScheduler,
+    ) -> None:
         self._allocator = quota_allocator  # type: ignore[assignment]
-        self._scheduler = schedule_policy  # type: ignore[assignment]
+        self._scheduler = quota_scheduler  # type: ignore[assignment]
 
     @property
     def quota_allocator(self) -> QuotaAllocator:
         return self._allocator  # type: ignore[return-value]
 
     @property
-    def schedule_policy(self) -> SchedulePolicy:
+    def quota_scheduler(self) -> QuotaScheduler:
         return self._scheduler  # type: ignore[return-value]
 
     def __repr__(self) -> str:
         return (
             f"CompositeMixStrategy(quota_allocator={self._allocator!r}, "
-            f"schedule_policy={self._scheduler!r})"
+            f"quota_scheduler={self._scheduler!r})"
         )
 
     def state_dict(self) -> dict[str, Any]:
+        scheduler_state = self._scheduler.state_dict()
         return {
             "type": "composite",
             "quota_allocator": self._allocator.state_dict(),
-            "schedule_policy": self._scheduler.state_dict(),
+            "quota_scheduler": scheduler_state,
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         qa_state = state["quota_allocator"]
-        sp_state = state["schedule_policy"]
-        qa_factory = _QUOTA_ALLOCATOR_FROM_STATE.get(qa_state.get("type"))
-        sp_factory = _SCHEDULE_POLICY_FROM_STATE.get(sp_state.get("type"))
-        if qa_factory is None or sp_factory is None:
-            raise ValueError(f"Cannot restore composite strategy: qa={qa_state}, sp={sp_state}")
-        qa = qa_factory(qa_state)
-        sp = sp_factory(sp_state)
-        qa.load_state_dict(qa_state)
-        sp.load_state_dict(sp_state)
+        quota_scheduler_state = state.get("quota_scheduler")
+        if not isinstance(quota_scheduler_state, dict):
+            raise ValueError("composite strategy state missing quota_scheduler")
+        qa, sp = restore_quota_and_schedule(
+            qa_state,
+            quota_scheduler_state,
+            error_prefix="Cannot restore composite strategy",
+        )
         self._allocator = qa
         self._scheduler = sp
 
 
 def custom_mix_strategy(
     quota_allocator: QuotaAllocator,
-    schedule_policy: SchedulePolicy,
+    quota_scheduler: QuotaScheduler,
 ) -> CompositeMixStrategy:
-    """Build a custom MixStrategy from public allocator + schedule components."""
-    return CompositeMixStrategy(quota_allocator=quota_allocator, schedule_policy=schedule_policy)
+    """Build a custom MixStrategy from public allocator + scheduler components."""
+    return CompositeMixStrategy(
+        quota_allocator=quota_allocator,
+        quota_scheduler=quota_scheduler,
+    )
 
 
 class LargestRemainderStrategy(CompositeMixStrategy):
@@ -574,7 +313,7 @@ class LargestRemainderStrategy(CompositeMixStrategy):
     """
 
     def __init__(self) -> None:
-        super().__init__(quota_allocator=LargestRemainderAllocator(), schedule_policy=SmoothInterleaveSchedule())
+        super().__init__(quota_allocator=LargestRemainderAllocator(), quota_scheduler=SmoothInterleaveSchedule())
 
     def __repr__(self) -> str:
         return "LargestRemainderStrategy()"
@@ -598,7 +337,7 @@ class WeightedRandomStrategy(CompositeMixStrategy):
     """
 
     def __init__(self, *, temperature: float = 1.0) -> None:
-        super().__init__(quota_allocator=MultinomialAllocator(temperature=temperature), schedule_policy=RandomShuffleSchedule())
+        super().__init__(quota_allocator=MultinomialAllocator(temperature=temperature), quota_scheduler=RandomShuffleSchedule())
 
     def __repr__(self) -> str:
         return f"WeightedRandomStrategy(temperature={self.temperature!r})"
@@ -626,7 +365,7 @@ class RoundRobinStrategy(CompositeMixStrategy):
     """Exact proportional allocation with strict round-robin interleaving."""
 
     def __init__(self) -> None:
-        super().__init__(quota_allocator=LargestRemainderAllocator(), schedule_policy=RoundRobinSchedule())
+        super().__init__(quota_allocator=LargestRemainderAllocator(), quota_scheduler=RoundRobinSchedule())
 
     def __repr__(self) -> str:
         return "RoundRobinStrategy()"
@@ -643,7 +382,7 @@ class ShuffleSequentialStrategy(CompositeMixStrategy):
     in a randomly shuffled order (each child's block is contiguous)."""
 
     def __init__(self) -> None:
-        super().__init__(quota_allocator=LargestRemainderAllocator(), schedule_policy=ShuffleSequentialSchedule())
+        super().__init__(quota_allocator=LargestRemainderAllocator(), quota_scheduler=ShuffleSequentialSchedule())
 
     def __repr__(self) -> str:
         return "ShuffleSequentialStrategy()"
@@ -664,7 +403,7 @@ class StratifiedRandomStrategy(CompositeMixStrategy):
     """
 
     def __init__(self) -> None:
-        super().__init__(quota_allocator=LargestRemainderAllocator(), schedule_policy=StratifiedRandomSchedule())
+        super().__init__(quota_allocator=LargestRemainderAllocator(), quota_scheduler=StratifiedRandomSchedule())
 
     def __repr__(self) -> str:
         return "StratifiedRandomStrategy()"
@@ -686,7 +425,7 @@ _STRATEGY_REGISTRY: dict[str, Callable[[dict[str, Any]], MixStrategy]] = {
     MIX_STRATEGY_STRATIFIED_RANDOM:  lambda s: StratifiedRandomStrategy(),
     "composite":                    lambda s: CompositeMixStrategy(
         quota_allocator=LargestRemainderAllocator(),
-        schedule_policy=SmoothInterleaveSchedule(),
+        quota_scheduler=SmoothInterleaveSchedule(),
     ),
 }
 
@@ -715,12 +454,12 @@ def mix_strategy_from_state(state: dict[str, Any]) -> MixStrategy:
         strategy.load_state_dict(state)
         return strategy
 
-    # Legacy format: "composite" wrapper with nested quota_allocator + schedule_policy.
-    if t == "composite" and "quota_allocator" in state and "schedule_policy" in state:
+    # Composite strategy with nested quota allocator + quota stream scheduler.
+    if t == "composite" and "quota_allocator" in state and "quota_scheduler" in state:
         return _strategy_from_legacy_composite(state)
 
-    # Legacy format: MixNode state_dict had quota_allocator + schedule_policy at top level.
-    if "quota_allocator" in state and "schedule_policy" in state:
+    # Top-level composite payload.
+    if "quota_allocator" in state and "quota_scheduler" in state:
         return _strategy_from_legacy_composite(state)
 
     raise ValueError(
@@ -729,15 +468,19 @@ def mix_strategy_from_state(state: dict[str, Any]) -> MixStrategy:
 
 
 def _strategy_from_legacy_composite(state: dict[str, Any]) -> MixStrategy:
-    """Reconstruct a MixStrategy from a legacy composite state dict."""
+    """Reconstruct a MixStrategy from a composite state dict.
+
+    Accepts the unified ``quota_scheduler`` field.
+    """
     qa_state = state["quota_allocator"]
-    sp_state = state["schedule_policy"]
-    qa_factory = _QUOTA_ALLOCATOR_FROM_STATE.get(qa_state.get("type"))
-    sp_factory = _SCHEDULE_POLICY_FROM_STATE.get(sp_state.get("type"))
-    if qa_factory is None or sp_factory is None:
-        raise ValueError(f"Cannot restore legacy composite: qa={qa_state}, sp={sp_state}")
-    qa = qa_factory(qa_state)
-    sp = sp_factory(sp_state)
+    sp_state = state.get("quota_scheduler")
+    if not isinstance(sp_state, dict):
+        raise ValueError("composite state missing quota_scheduler")
+    qa, sp = restore_quota_and_schedule(
+        qa_state,
+        sp_state,
+        error_prefix="Cannot restore legacy composite",
+    )
     # Map back to the closest named strategy where possible.
     type_map = {
         ("largest_remainder", "smooth_interleave"): LargestRemainderStrategy,
@@ -759,7 +502,7 @@ def _strategy_from_legacy_composite(state: dict[str, Any]) -> MixStrategy:
         def state_dict(self):
             return {"type": "composite",
                     "quota_allocator": qa.state_dict(),
-                    "schedule_policy": sp.state_dict()}
+                    "quota_scheduler": sp.state_dict()}
         def load_state_dict(self, s): pass
 
     inst = _RestoredStrategy()
@@ -794,9 +537,9 @@ def mix_strategy_from_registry(
     *,
     strategy_name: Optional[str] = None,
     quota_type: Optional[str] = None,
-    schedule_type: Optional[str] = None,
+    quota_scheduler_type: Optional[str] = None,
     quota_state: Optional[dict[str, Any]] = None,
-    schedule_state: Optional[dict[str, Any]] = None,
+    quota_scheduler_state: Optional[dict[str, Any]] = None,
     temperature: Optional[float] = None,
 ) -> MixStrategy:
     """Build a :class:`MixStrategy` from registry keys (unified entry for mix layer).
@@ -804,26 +547,32 @@ def mix_strategy_from_registry(
     Either:
 
     - ``strategy_name``: one of :data:`COMPOSABLE_MIX_STRATEGIES` (same as :func:`mix_strategy_from_name`).
-    - ``quota_type`` and ``schedule_type``: composite strategy from :data:`COMPOSABLE_QUOTA_ALLOCATOR_TYPES`
-      × :data:`COMPOSABLE_SCHEDULE_POLICY_TYPES` (same as :func:`custom_mix_strategy`).
+        - ``quota_type`` and ``quota_scheduler_type``: composite strategy from
+            :data:`COMPOSABLE_QUOTA_ALLOCATOR_TYPES` x :data:`COMPOSABLE_QUOTA_SCHEDULER_TYPES`
+      (same as :func:`custom_mix_strategy`).
 
     ``temperature`` applies only when ``strategy_name`` is ``weighted_random``; for ``multinomial``
     allocation use *quota_state* or :func:`quota_allocator_from_registry` ``temperature=``.
     """
     if strategy_name is not None:
-        if quota_type is not None or schedule_type is not None:
+        if quota_type is not None or quota_scheduler_type is not None:
             raise ValueError(
-                "mix_strategy_from_registry: pass either strategy_name or (quota_type, schedule_type), not both"
+                "mix_strategy_from_registry: pass either strategy_name or (quota_type, quota_scheduler_type), not both"
             )
         return mix_strategy_from_name(strategy_name, temperature=temperature)
-    if quota_type is not None and schedule_type is not None:
+    if quota_type is not None and quota_scheduler_type is not None:
         qa = quota_allocator_from_registry(quota_type, quota_state or {})
-        sp = schedule_policy_from_registry(schedule_type, schedule_state or {})
+        sp = quota_scheduler_from_registry(
+            quota_scheduler_type,
+            quota_scheduler_state or {},
+        )
         return custom_mix_strategy(qa, sp)
-    if quota_type is not None or schedule_type is not None:
-        raise ValueError("quota_type and schedule_type must both be set for a composite mix strategy")
+    if quota_type is not None or quota_scheduler_type is not None:
+        raise ValueError(
+            "quota_type and quota_scheduler_type must both be set for a composite mix strategy"
+        )
     raise ValueError(
-        "mix_strategy_from_registry requires strategy_name=... or quota_type=... and schedule_type=...; "
+        "mix_strategy_from_registry requires strategy_name=... or quota_type=... and quota_scheduler_type=...; "
         f"registered mix keys: {sorted(registered_mix_strategy_types())}"
     )
 
@@ -1350,11 +1099,10 @@ class MixNode:
         else:
             self._rng = _epoch_rng(self.base_seed, self.epoch)
 
-        # Restore strategy — handles both current and legacy state formats.
+        # Restore strategy from the unified state format.
         if "strategy" in state:
             self._strategy = mix_strategy_from_state(state["strategy"])
-        elif "quota_allocator" in state and "schedule_policy" in state:
-            # Legacy format: quota_allocator + schedule_policy at top level.
+        elif "quota_allocator" in state and "quota_scheduler" in state:
             self._strategy = _strategy_from_legacy_composite(state)
         # else: keep existing strategy (no-op for partial updates).
 
