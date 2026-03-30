@@ -18,6 +18,7 @@ import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.training.composable_dataloader as _composable_dataloader
 import openpi.training.composable_sampler as _composable_sampler
+from openpi.training.mixing import largest_remainder_allocate
 import openpi.transforms as _transforms
 from openpi.training.pytree_utils import (
     aligned_size_for_sharding,
@@ -901,7 +902,8 @@ def _mix_strategy_from_sampler_config(
     mix = cfg.mix
     if isinstance(mix, _config.RegistryMixStrategy):
         return _composable_sampler.mix_strategy_from_registry(
-            quota_type=mix.quota_type, schedule_type=mix.schedule_type
+            quota_type=mix.quota_type,
+            quota_scheduler_type=mix.quota_scheduler_type,
         )
     return _composable_sampler.mix_strategy_from_name(mix.name, temperature=mix.temperature)
 
@@ -1036,7 +1038,10 @@ def _build_from_composable_sampler_config(
     indent = "  " * _depth
     mix = node.mix
     if isinstance(mix, _config.RegistryMixStrategy):
-        mix_desc = f"mix=RegistryMixStrategy({mix.quota_type!r}, {mix.schedule_type!r})"
+        mix_desc = (
+            f"mix=RegistryMixStrategy({mix.quota_type!r}, "
+            f"{mix.quota_scheduler_type!r})"
+        )
     else:
         mix_desc = f"mix=NamedMixStrategy({mix.name!r})"
     lt = node.leaf_traversal
@@ -1121,7 +1126,7 @@ def _build_composable_from_node(
         # samples_per_loader[i] samples per step after dividing by process_count.
         local_batch = config.batch_size // process_count
         inbatch_w = list(weights) if weights is not None else [1.0] * len(inputs)
-        samples_per_loader = _composable_sampler.largest_remainder_allocate(
+        samples_per_loader = largest_remainder_allocate(
             local_batch, inbatch_w
         ).tolist()
     else:

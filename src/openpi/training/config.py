@@ -555,15 +555,15 @@ class NamedMixStrategy:
 
 @dataclasses.dataclass(frozen=True)
 class RegistryMixStrategy:
-    """Composite mix strategy built from independent quota allocator x schedule policy.
+    """Composite mix strategy built from independent quota allocator x quota scheduler.
 
-    Both ``quota_type`` and ``schedule_type`` must be registered keys; see
+    Both ``quota_type`` and ``quota_scheduler_type`` must be registered keys; see
     :data:`composable_sampler.COMPOSABLE_QUOTA_ALLOCATOR_TYPES` and
-    :data:`composable_sampler.COMPOSABLE_SCHEDULE_POLICY_TYPES`.
+    :data:`composable_sampler.COMPOSABLE_QUOTA_SCHEDULER_TYPES`.
     """
 
     quota_type: str
-    schedule_type: str
+    quota_scheduler_type: str
 
     def __post_init__(self) -> None:
         if self.quota_type not in _composable_sampler.registered_quota_allocator_types():
@@ -571,10 +571,10 @@ class RegistryMixStrategy:
                 f"Unknown quota_type {self.quota_type!r}; "
                 f"expected one of {sorted(_composable_sampler.registered_quota_allocator_types())}"
             )
-        if self.schedule_type not in _composable_sampler.registered_schedule_policy_types():
+        if self.quota_scheduler_type not in _composable_sampler.registered_quota_scheduler_types():
             raise ValueError(
-                f"Unknown schedule_type {self.schedule_type!r}; "
-                f"expected one of {sorted(_composable_sampler.registered_schedule_policy_types())}"
+                f"Unknown quota_scheduler_type {self.quota_scheduler_type!r}; "
+                f"expected one of {sorted(_composable_sampler.registered_quota_scheduler_types())}"
             )
 
 

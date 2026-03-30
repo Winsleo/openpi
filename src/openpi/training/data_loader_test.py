@@ -439,12 +439,15 @@ def test_named_mix_strategy_unknown_name() -> None:
 
 def test_registry_mix_strategy_unknown_quota_type() -> None:
     with pytest.raises(ValueError, match="Unknown quota_type"):
-        _config.RegistryMixStrategy(quota_type="bad_quota", schedule_type="smooth_interleave")
+        _config.RegistryMixStrategy(quota_type="bad_quota", quota_scheduler_type="smooth_interleave")
 
 
-def test_registry_mix_strategy_unknown_schedule_type() -> None:
-    with pytest.raises(ValueError, match="Unknown schedule_type"):
-        _config.RegistryMixStrategy(quota_type="largest_remainder", schedule_type="bad_schedule")
+def test_registry_mix_strategy_unknown_quota_scheduler_type() -> None:
+    with pytest.raises(ValueError, match="Unknown quota_scheduler_type"):
+        _config.RegistryMixStrategy(
+            quota_type="largest_remainder",
+            quota_scheduler_type="bad_schedule",
+        )
 
 
 def test_leaf_traversal_config_unknown_traversal() -> None:
@@ -529,7 +532,7 @@ def test_composable_sampler_config_registry_mix_and_leaf_traversal_accepted() ->
         children=(_config.FakeDataConfig(), _config.FakeDataConfig()),
         mix=_config.RegistryMixStrategy(
             quota_type="largest_remainder",
-            schedule_type="smooth_interleave",
+            quota_scheduler_type="smooth_interleave",
         ),
         leaf_traversal=_config.LeafTraversalConfig(
             traversal=_composable_sampler.TRAVERSAL_AFFINE_PERMUTATION
@@ -560,14 +563,16 @@ def test_mix_strategy_from_sampler_config_named_vs_registry() -> None:
     reg = _config.ComposableSamplerConfig(
         children=(_config.FakeDataConfig(), _config.FakeDataConfig()),
         mix=_config.RegistryMixStrategy(
-            quota_type="largest_remainder", schedule_type="smooth_interleave"
+            quota_type="largest_remainder",
+            quota_scheduler_type="smooth_interleave",
         ),
         seed=0,
         num_samples=8,
     )
     s_reg = _data_loader._mix_strategy_from_sampler_config(reg)
     s_reg_ref = _composable_sampler.mix_strategy_from_registry(
-        quota_type="largest_remainder", schedule_type="smooth_interleave"
+        quota_type="largest_remainder",
+        quota_scheduler_type="smooth_interleave",
     )
     assert type(s_reg) is type(s_reg_ref)
 
