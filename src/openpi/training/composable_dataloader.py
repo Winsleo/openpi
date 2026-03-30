@@ -27,6 +27,7 @@ Example:
 """
 
 from abc import ABC, abstractmethod
+import copy
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 import itertools
@@ -36,6 +37,18 @@ from typing import Any, Optional, Protocol, TypeVar, Union, runtime_checkable
 import numpy as np
 import torch
 from torch.utils.data import DataLoader as TorchDataLoader, Dataset as TorchDataset
+from openpi.training.mixing import (
+    OnlineSourceScheduler,
+    ProportionalRandomScheduler,
+    QuotaAllocator,
+    extract_type_from_state,
+    LargestRemainderAllocator,
+    schedule_and_consume,
+    online_scheduler_from_name,
+    quota_allocator_from_registry,
+    largest_remainder_allocate,
+    normalize_weights,
+)
 from openpi.training.loader_ident import get_loader_ident
 from openpi.training.pytree_utils import (
     get_jax,
@@ -52,6 +65,7 @@ __all__ = [
     "get_rng",
     # Utility functions
     "normalize_weights",
+    "largest_remainder_allocate",
     # Batch-count sentinels
     "LONGEST",
     "SHORTEST",
@@ -129,47 +143,29 @@ def get_rng() -> np.random.Generator:
 # =============================================================================
 
 
-def normalize_weights(weights: Sequence[float]) -> np.ndarray:
-    """Normalize non-negative weights to sum to 1.
+def _spawn_rng(seed: Optional[int] = None) -> np.random.Generator:
+    """Create an instance RNG.
 
-    Raises:
-        ValueError: If weights are empty, multi-dimensional, contain negative
-            values, or all weights sum to 0.
+    If *seed* is None, derive a child seed from the module-level RNG to keep
+    the global seeding contract while avoiding shared mutable RNG state between
+    loader instances.
     """
-    w = np.asarray(weights, dtype=np.float64)
-    if w.ndim != 1 or w.size == 0:
-        raise ValueError("weights must be a non-empty 1D sequence")
-    if np.any(w < 0):
-        raise ValueError(f"weights must be non-negative, got {weights}")
-    s = float(w.sum())
-    if s <= 0:
-        raise ValueError("weights must not all be zero")
-    return w / s
+    if seed is not None:
+        return np.random.default_rng(seed)
+    child_seed = int(get_rng().integers(0, np.iinfo(np.uint64).max, dtype=np.uint64))
+    return np.random.default_rng(child_seed)
 
 
-def _weighted_choice(
-    num_loaders: int,
-    base_weights: np.ndarray,
-    active: np.ndarray,
-    buf: np.ndarray,
-) -> int:
-    """Pick a loader index via weighted random choice over active loaders.
+def _rng_state_dict(rng: np.random.Generator) -> dict[str, Any]:
+    return copy.deepcopy(rng.bit_generator.state)
 
-    Args:
-        num_loaders: Total number of loaders.
-        base_weights: Base weight array (not mutated).
-        active: Boolean mask of active loaders.
-        buf: Pre-allocated float64 buffer (len == num_loaders).
 
-    Returns:
-        Selected loader index, or -1 if no active loaders.
-    """
-    np.multiply(base_weights, active, out=buf)
-    total = buf.sum()
-    if total == 0:
-        return -1
-    buf /= total
-    return int(_rng.choice(num_loaders, p=buf))
+def _restore_rng_state(state: dict[str, Any]) -> np.random.Generator:
+    bitgen_name = str(state.get("bit_generator", "PCG64"))
+    bitgen_cls = getattr(np.random, bitgen_name, np.random.PCG64)
+    bitgen = bitgen_cls()
+    bitgen.state = copy.deepcopy(state)
+    return np.random.Generator(bitgen)
 
 
 # =============================================================================
@@ -300,6 +296,17 @@ class ComposableDataLoader(ABC, BaseDataLoader):
         """Check if an object satisfies the BaseDataLoader protocol."""
         return isinstance(obj, BaseDataLoader)
 
+    def state_dict(self) -> dict[str, Any]:
+        """Serializable state for checkpointing loader-specific behavior."""
+        return {
+            "type": type(self).__name__,
+            "last_loader_idx": copy.deepcopy(self._last_loader_idx),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore state from :meth:`state_dict`."""
+        self._last_loader_idx = copy.deepcopy(state.get("last_loader_idx"))
+
 
 # =============================================================================
 # Multi-Source Base Class  (Composite)
@@ -324,6 +331,8 @@ class MultiSourceDataLoader(ComposableDataLoader):
         self,
         dataloaders: Sequence[BaseDataLoader],
         stop_strategy: str = LONGEST,
+        *,
+        seed: Optional[int] = None,
     ):
         super().__init__()
         self.dataloaders = list(dataloaders)
@@ -335,6 +344,37 @@ class MultiSourceDataLoader(ComposableDataLoader):
             )
         self._num_loaders = len(self.dataloaders)
         self._stop_strategy = stop_strategy
+        self._rng = _spawn_rng(seed)
+
+    def state_dict(self) -> dict[str, Any]:
+        state = super().state_dict()
+        state.update({
+            "stop_strategy": self._stop_strategy,
+            "num_loaders": self._num_loaders,
+            "rng_state": _rng_state_dict(self._rng),
+            "children": [
+                ld.state_dict() if hasattr(ld, "state_dict") else None
+                for ld in self.dataloaders
+            ],
+        })
+        return state
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        super().load_state_dict(state)
+        saved_num = int(state.get("num_loaders", self._num_loaders))
+        if saved_num != self._num_loaders:
+            raise ValueError(
+                f"state expects {saved_num} loaders, but got {self._num_loaders}"
+            )
+        self._stop_strategy = str(state.get("stop_strategy", self._stop_strategy))
+        rng_state = state.get("rng_state")
+        if isinstance(rng_state, dict):
+            self._rng = _restore_rng_state(rng_state)
+        child_states = state.get("children", [])
+        if isinstance(child_states, list):
+            for child, child_state in zip(self.dataloaders, child_states):
+                if child_state is not None and hasattr(child, "load_state_dict"):
+                    child.load_state_dict(child_state)
 
     @property
     def _is_shortest(self) -> bool:
@@ -354,7 +394,7 @@ class MultiSourceDataLoader(ComposableDataLoader):
         """Default length estimate based on stop strategy.
 
         LONGEST: sum of all child lengths (every loader fully consumed).
-        SHORTEST: min child length × number of loaders (stop when first exhausts).
+        SHORTEST: min child length x number of loaders (stop when first exhausts).
         """
         if self._is_shortest:
             return min(len(ld) for ld in self.dataloaders) * self._num_loaders
@@ -416,6 +456,17 @@ class SingleLoaderWrapper(ComposableDataLoader):
         """Unwrap all intermediate wrappers and return the innermost loader."""
         return getattr(self.inner, "unwrapped", self.inner)
 
+    def state_dict(self) -> dict[str, Any]:
+        state = super().state_dict()
+        state["inner"] = self._inner.state_dict() if hasattr(self._inner, "state_dict") else None
+        return state
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        super().load_state_dict(state)
+        inner_state = state.get("inner")
+        if inner_state is not None and hasattr(self._inner, "load_state_dict"):
+            self._inner.load_state_dict(inner_state)
+
 
 # =============================================================================
 # Round-Robin DataLoader
@@ -437,8 +488,14 @@ class RoundRobinDataLoader(MultiSourceDataLoader):
         >>> # Yields: batch_a, batch_b, batch_c, batch_a, batch_b, ...
     """
 
-    def __init__(self, dataloaders: Sequence[BaseDataLoader], stop_strategy: str = LONGEST):
-        super().__init__(dataloaders, stop_strategy)
+    def __init__(
+        self,
+        dataloaders: Sequence[BaseDataLoader],
+        stop_strategy: str = LONGEST,
+        *,
+        seed: Optional[int] = None,
+    ):
+        super().__init__(dataloaders, stop_strategy, seed=seed)
 
     def __iter__(self):
         iterators = self._create_iterators()
@@ -492,34 +549,63 @@ class RandomMixDataLoader(MultiSourceDataLoader):
         dataloaders: Sequence[BaseDataLoader],
         weights: Optional[Sequence[float]] = None,
         stop_strategy: str = LONGEST,
+        online_scheduler: str | OnlineSourceScheduler | None = None,
+        online_scheduler_state: Optional[dict[str, Any]] = None,
+        *,
+        seed: Optional[int] = None,
     ):
-        super().__init__(dataloaders, stop_strategy)
+        super().__init__(dataloaders, stop_strategy, seed=seed)
         self.weights = normalize_weights(
             weights if weights is not None else [1.0] * self._num_loaders
         )
+        if online_scheduler is None:
+            self._online_scheduler = ProportionalRandomScheduler()
+        elif isinstance(online_scheduler, str):
+            self._online_scheduler = online_scheduler_from_name(online_scheduler, online_scheduler_state)
+        else:
+            self._online_scheduler = online_scheduler
 
     def __iter__(self):
         iterators = self._create_iterators()
-        active = np.ones(self._num_loaders, dtype=bool)
-        buf = np.empty(self._num_loaders, dtype=np.float64)
-
-        while active.any():
-            idx = _weighted_choice(self._num_loaders, self.weights, active, buf)
-            if idx < 0:
-                break
-            try:
-                self._last_loader_idx = idx
-                yield next(iterators[idx])
-            except StopIteration:
-                if self._is_shortest:
-                    return
-                active[idx] = False
+        for idx, batch in schedule_and_consume(
+            iterators,
+            self.weights,
+            self._rng,
+            self._online_scheduler,
+            stop_on_exhausted=self._is_shortest,
+        ):
+            self._last_loader_idx = idx
+            yield batch
 
     def __len__(self) -> int:
         draws = [len(ld) / w for ld, w in zip(self.dataloaders, self.weights)]
         if self._is_shortest:
             return int(np.floor(min(draws)))
         return int(np.ceil(max(draws)))
+
+    def state_dict(self) -> dict[str, Any]:
+        state = super().state_dict()
+        state.update({
+            "weights": self.weights.tolist(),
+            "online_scheduler": {
+                "type": extract_type_from_state(self._online_scheduler, "proportional_random"),
+                "state": self._online_scheduler.state_dict() if hasattr(self._online_scheduler, "state_dict") else {},
+            },
+        })
+        return state
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        super().load_state_dict(state)
+        if "weights" in state:
+            self.weights = normalize_weights(state["weights"])
+        online_scheduler_state = state.get("online_scheduler")
+        if isinstance(online_scheduler_state, dict):
+            type_name = str(online_scheduler_state.get("type", "proportional_random"))
+            payload = online_scheduler_state.get("state")
+            self._online_scheduler = online_scheduler_from_name(
+                type_name,
+                payload if isinstance(payload, dict) else None,
+            )
 
 
 # =============================================================================
@@ -570,8 +656,27 @@ class ProportionalMixDataLoader(MultiSourceDataLoader):
         dataloaders: Sequence[BaseDataLoader],
         ratios: Optional[Sequence[float]] = None,
         stop_strategy: str = LONGEST,
+        quota_allocator: str | QuotaAllocator | None = None,
+        online_scheduler: str | OnlineSourceScheduler | None = None,
+        quota_state: Optional[dict[str, Any]] = None,
+        online_scheduler_state: Optional[dict[str, Any]] = None,
+        *,
+        seed: Optional[int] = None,
     ):
-        super().__init__(dataloaders, stop_strategy)
+        super().__init__(dataloaders, stop_strategy, seed=seed)
+        if quota_allocator is None:
+            self._quota_allocator = LargestRemainderAllocator()
+        elif isinstance(quota_allocator, str):
+            self._quota_allocator = quota_allocator_from_registry(quota_allocator, quota_state)
+        else:
+            self._quota_allocator = quota_allocator
+
+        if online_scheduler is None:
+            self._online_scheduler = ProportionalRandomScheduler()
+        elif isinstance(online_scheduler, str):
+            self._online_scheduler = online_scheduler_from_name(online_scheduler, online_scheduler_state)
+        else:
+            self._online_scheduler = online_scheduler
         ratios_arr = normalize_weights(
             ratios if ratios is not None else [1.0] * self._num_loaders
         )
@@ -583,44 +688,69 @@ class ProportionalMixDataLoader(MultiSourceDataLoader):
         else:
             # SHORTEST: no child loader needs to restart (stop at first exhaustion)
             total_batches = int(np.floor(min(lengths_over_ratios)))
-        self.batches_per_loader = (ratios_arr * total_batches).astype(int)
-        # Distribute remainder to last loader
-        self.batches_per_loader[-1] += total_batches - int(self.batches_per_loader.sum())
+        self.batches_per_loader = np.asarray(
+            self._quota_allocator.allocate(ratios_arr, total_batches, self._rng),
+            dtype=np.int64,
+        )
         self._total_batches = int(self.batches_per_loader.sum())
+        self._ratios = ratios_arr.copy()
 
     def __iter__(self):
         iterators = self._create_iterators()
-        remaining = self.batches_per_loader.astype(np.float64)
-        buf = np.empty(self._num_loaders, dtype=np.float64)
-        dead = np.zeros(self._num_loaders, dtype=bool)
-
-        for _ in range(self._total_batches):
-            # Zero out dead loaders so they are never selected
-            remaining[dead] = 0
-            total = remaining.sum()
-            if total <= 0:
-                break
-            np.divide(remaining, total, out=buf)
-            idx = int(_rng.choice(self._num_loaders, p=buf))
-            remaining[idx] -= 1
-
-            try:
-                batch = next(iterators[idx])
-            except StopIteration:
-                # Restart exhausted loader
-                iterators[idx] = iter(self.dataloaders[idx])
-                try:
-                    batch = next(iterators[idx])
-                except StopIteration:
-                    # Loader is empty even after restart — mark dead
-                    dead[idx] = True
-                    continue
-
+        for idx, batch in schedule_and_consume(
+            iterators,
+            self.batches_per_loader,
+            self._rng,
+            self._online_scheduler,
+            max_steps=self._total_batches,
+            decrement_after_selection=True,
+            restart_stream=lambda i: iter(self.dataloaders[i]),
+        ):
             self._last_loader_idx = idx
             yield batch
 
     def __len__(self):
         return self._total_batches
+
+    def state_dict(self) -> dict[str, Any]:
+        state = super().state_dict()
+        state.update({
+            "ratios": self._ratios.tolist(),
+            "batches_per_loader": self.batches_per_loader.tolist(),
+            "total_batches": self._total_batches,
+            "quota_allocator": {
+                "type": extract_type_from_state(self._quota_allocator, "largest_remainder"),
+                "state": self._quota_allocator.state_dict() if hasattr(self._quota_allocator, "state_dict") else {},
+            },
+            "online_scheduler": {
+                "type": extract_type_from_state(self._online_scheduler, "proportional_random"),
+                "state": self._online_scheduler.state_dict() if hasattr(self._online_scheduler, "state_dict") else {},
+            },
+        })
+        return state
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        super().load_state_dict(state)
+        if "ratios" in state:
+            self._ratios = normalize_weights(state["ratios"])
+        if "batches_per_loader" in state:
+            self.batches_per_loader = np.asarray(state["batches_per_loader"], dtype=np.int64)
+        self._total_batches = int(state.get("total_batches", int(self.batches_per_loader.sum())))
+
+        qa = state.get("quota_allocator")
+        if isinstance(qa, dict):
+            type_name = str(qa.get("type", "largest_remainder"))
+            payload = qa.get("state")
+            self._quota_allocator = quota_allocator_from_registry(type_name, payload if isinstance(payload, dict) else None)
+
+        online_scheduler_state = state.get("online_scheduler")
+        if isinstance(online_scheduler_state, dict):
+            type_name = str(online_scheduler_state.get("type", "proportional_random"))
+            payload = online_scheduler_state.get("state")
+            self._online_scheduler = online_scheduler_from_name(
+                type_name,
+                payload if isinstance(payload, dict) else None,
+            )
 
 
 # =============================================================================
@@ -650,8 +780,10 @@ class AlternatingDataLoader(MultiSourceDataLoader):
         dataloaders: Sequence[BaseDataLoader],
         pattern: Optional[Sequence[int]] = None,
         stop_strategy: str = LONGEST,
+        *,
+        seed: Optional[int] = None,
     ):
-        super().__init__(dataloaders, stop_strategy)
+        super().__init__(dataloaders, stop_strategy, seed=seed)
         self.pattern = list(pattern) if pattern else list(range(self._num_loaders))
 
     def __iter__(self):
@@ -732,9 +864,11 @@ class TaskTaggedDataLoader(MultiSourceDataLoader):
         sampling_strategy: str = 'random',
         propagate_tags: bool = False,
         stop_strategy: str = LONGEST,
+        *,
+        seed: Optional[int] = None,
     ):
         # TaskTaggedDataLoader uses a dict; store list of values for base class
-        super().__init__(list(dataloaders.values()), stop_strategy)
+        super().__init__(list(dataloaders.values()), stop_strategy, seed=seed)
         self._dataloaders_dict = dataloaders
         self.task_names = list(dataloaders.keys())
         self._task_to_idx = {name: i for i, name in enumerate(self.task_names)}
@@ -751,7 +885,7 @@ class TaskTaggedDataLoader(MultiSourceDataLoader):
 
         while active_count > 0:
             if self.sampling_strategy == 'random':
-                task = str(_rng.choice(active_list))
+                task = str(self._rng.choice(active_list))
             elif task_cycle is not None:
                 task = next(task_cycle)
                 while not active[self._task_to_idx[task]]:
@@ -823,8 +957,15 @@ class DynamicScheduleDataLoader(RandomMixDataLoader):
         initial_weights: Optional[Sequence[float]] = None,
         enable_tracking: bool = True,
         stop_strategy: str = LONGEST,
+        *,
+        seed: Optional[int] = None,
     ):
-        super().__init__(dataloaders, weights=initial_weights, stop_strategy=stop_strategy)
+        super().__init__(
+            dataloaders,
+            weights=initial_weights,
+            stop_strategy=stop_strategy,
+            seed=seed,
+        )
         self.enable_tracking = enable_tracking
         self.loader_performance: dict[int, list] = defaultdict(list)
         self.batches_from_loader = [0] * self._num_loaders
@@ -877,6 +1018,30 @@ class DynamicScheduleDataLoader(RandomMixDataLoader):
             'current_weights': self.weights.tolist(),
             'performance_history': dict(self.loader_performance),
         }
+
+    def state_dict(self) -> dict[str, Any]:
+        state = super().state_dict()
+        state.update({
+            "enable_tracking": self.enable_tracking,
+            "loader_performance": {
+                int(k): list(v) for k, v in self.loader_performance.items()
+            },
+            "batches_from_loader": list(self.batches_from_loader),
+        })
+        return state
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        super().load_state_dict(state)
+        self.enable_tracking = bool(state.get("enable_tracking", self.enable_tracking))
+        perf = state.get("loader_performance")
+        if isinstance(perf, dict):
+            self.loader_performance = defaultdict(
+                list,
+                {int(k): list(v) for k, v in perf.items()},
+            )
+        batches = state.get("batches_from_loader")
+        if isinstance(batches, list) and len(batches) == self._num_loaders:
+            self.batches_from_loader = [int(x) for x in batches]
 
 
 # =============================================================================
@@ -970,8 +1135,10 @@ class InBatchMixDataLoader(MultiSourceDataLoader):
         total_batch_size: Optional[int] = None,
         random_sample: bool = False,
         stop_strategy: str = SHORTEST,
+        *,
+        seed: Optional[int] = None,
     ):
-        super().__init__(dataloaders, stop_strategy)
+        super().__init__(dataloaders, stop_strategy, seed=seed)
         self._random_sample = random_sample
         self._apply_sharding = None
         if self.sharding is not None:
@@ -1012,7 +1179,7 @@ class InBatchMixDataLoader(MultiSourceDataLoader):
         if batch_size <= num_samples:
             return data, labels, batch_size
         if self._random_sample:
-            indices = _rng.choice(batch_size, size=num_samples, replace=False)
+            indices = self._rng.choice(batch_size, size=num_samples, replace=False)
         else:
             indices = np.arange(num_samples)
         return slice_data(data, indices), slice_data(labels, indices), num_samples
@@ -1127,8 +1294,10 @@ class CurriculumDataLoader(MultiSourceDataLoader):
         dataloaders: Sequence[BaseDataLoader],
         stages: Sequence[Sequence[int]],
         batches_per_stage: Sequence[int],
+        *,
+        seed: Optional[int] = None,
     ):
-        super().__init__(dataloaders)
+        super().__init__(dataloaders, seed=seed)
         self.stages = [list(s) for s in stages]
         self.batches_per_stage = list(batches_per_stage)
         self.current_stage = 0
@@ -1140,7 +1309,7 @@ class CurriculumDataLoader(MultiSourceDataLoader):
         yielded = 0
 
         while yielded < total:
-            idx = int(_rng.choice(self.stages[self.current_stage]))
+            idx = int(self._rng.choice(self.stages[self.current_stage]))
             try:
                 batch = next(iterators[idx])
             except StopIteration:
@@ -1392,21 +1561,54 @@ class Compose:
         *loaders: BaseDataLoader, 
         weights: Optional[Sequence[float]] = None,
         stop_strategy: str = LONGEST,
+        online_scheduler: str | OnlineSourceScheduler | None = None,
+        online_scheduler_state: Optional[dict[str, Any]] = None,
+        seed: Optional[int] = None,
     ) -> RandomMixDataLoader:
-        """Create a weighted random mixing DataLoader."""
-        return RandomMixDataLoader(list(loaders), weights=weights, stop_strategy=stop_strategy)
+        """Create a weighted random mixing DataLoader.
+
+        ``online_scheduler`` accepts either a concrete scheduler instance or a
+        registered name (for example ``"proportional_random"``). When a name is
+        provided, ``online_scheduler_state`` is passed into the registry
+        factory and then into ``load_state_dict`` of that scheduler.
+        """
+        return RandomMixDataLoader(
+            list(loaders),
+            weights=weights,
+            stop_strategy=stop_strategy,
+            online_scheduler=online_scheduler,
+            online_scheduler_state=online_scheduler_state,
+            seed=seed,
+        )
     
     @staticmethod
     def proportional(
         *loaders: BaseDataLoader,
         ratios: Optional[Sequence[float]] = None,
         stop_strategy: str = LONGEST,
+        quota_allocator: str | QuotaAllocator | None = None,
+        online_scheduler: str | OnlineSourceScheduler | None = None,
+        quota_state: Optional[dict[str, Any]] = None,
+        online_scheduler_state: Optional[dict[str, Any]] = None,
+        seed: Optional[int] = None,
     ) -> ProportionalMixDataLoader:
         """Create a proportional allocation DataLoader.
 
         ``stop_strategy`` accepts ``LONGEST`` (default) or ``SHORTEST``.
+        ``quota_allocator`` and ``online_scheduler`` accept either concrete
+        instances or registered names. When names are provided, ``quota_state``
+        and ``online_scheduler_state`` are passed through the registry constructors.
         """
-        return ProportionalMixDataLoader(list(loaders), ratios=ratios, stop_strategy=stop_strategy)
+        return ProportionalMixDataLoader(
+            list(loaders),
+            ratios=ratios,
+            stop_strategy=stop_strategy,
+            quota_allocator=quota_allocator,
+            online_scheduler=online_scheduler,
+            quota_state=quota_state,
+            online_scheduler_state=online_scheduler_state,
+            seed=seed,
+        )
     
     @staticmethod
     def alternating(
